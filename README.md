@@ -39,4 +39,12 @@ The repository is **specification-first**. Mistral Vibe will scaffold the execut
 **Never commit API keys, credentials, precise live location traces, or real traveler identities.** Demo data is synthetic; mock review quality and candidate locations are *not* claims about real businesses.
 
 ## Current status
-Planning documents and demo fixtures are seeded. Implementation, live APIs, and deployment remain to be done.
+**Working MVP implemented.** `npm install && npm run dev` starts a fully offline demo (no API keys required):
+
+- `POST /api/recommend-stops` — the reusable engine endpoint: Zod-validated collective trip snapshot in, 2–3 ranked, explained stop recommendations out (or `STAY_SILENT`).
+- `/simulate` — deterministic Highway 401 Toronto → Montréal simulation with 3 cars, play/pause/scrub/speed controls, interactive SVG corridor map, chat with sample utterance chips, scenario sliders (weather, traffic, hunger), recommendation cards with per-car detours and trade-offs, lead approve + per-car join/skip, Google Maps handoff, opt-in voice readout, request/response inspector, rejection reasons and event log. Open `/simulate?demo=1` for a scripted auto-run.
+- Deterministic eligibility engine (lead time, GTA exclusion, hard dietary rules, EV charger compatibility, detour caps, group regroup wait, opening hours, stale-position degradation) with a pluggable AI provider (`AI_PROVIDER=mock|mistral`) that only ranks prevalidated candidates; hallucinated IDs are dropped and a deterministic ranker is the fallback.
+- `npm run test` (20 unit tests), `npm run build`, `npm run typecheck` all green. All stop/route data is synthetic and labeled SIMULATION.
+
+### Known limitations
+- In-memory demo state (no Supabase sync yet); map is a schematic SVG, not map tiles; voice works only while the page is active; no background GPS claims.

@@ -5,7 +5,7 @@ export const metadata = {
   title: "Uncongest — Highway 401 simulation"
 };
 
-export default function SimulatePage() {
+export default function SimulatePage({ searchParams }: { searchParams: { demo?: string } }) {
   return (
     <main className="min-h-screen">
       <header className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
@@ -14,7 +14,7 @@ export default function SimulatePage() {
           SIMULATION — synthetic data, no live APIs
         </span>
       </header>
-      <Simulator />
+      <Simulator autoDemo={searchParams.demo === "1"} />
     </main>
   );
 }

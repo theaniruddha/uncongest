@@ -15,7 +15,7 @@ interface LogEntry {
   kind: "info" | "trigger" | "decision" | "approval" | "silent";
 }
 
-export default function Simulator() {
+export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) {
   const sc = loadScenario();
   const [elapsed, setElapsed] = useState(30);
   const [playing, setPlaying] = useState(false);
@@ -53,6 +53,21 @@ export default function Simulator() {
   }, [playing, speed]);
 
   const pushLog = useCallback((entry: LogEntry) => setLog((l) => [...l.slice(-60), entry]), []);
+
+  useEffect(() => {
+    if (!autoDemo) return;
+    setPlaying(true);
+    const t = setTimeout(() => {
+      const merged = mergeCollectiveIntent(parseIntent("all very hungry, kids need washrooms"), {
+        need: [], hungerLevel: 1, dietary: ["vegetarian"], maxDetourMinutes: 12, kids: true
+      });
+      setNeeds(merged.need);
+      setHunger(3);
+      pushLog({ time: sim.localTime, text: 'Scripted demo: "all very hungry, kids need washrooms"', kind: "trigger" });
+      void runRecommendation(merged, "Scripted demo intent applied.");
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [autoDemo]);
 
   const daylight = Math.max(0, 120 - Math.max(0, elapsed - 120));
 
