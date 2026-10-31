@@ -1,0 +1,101 @@
+{
+  "disclaimer": "ALL STOPS ARE SYNTHETIC FOR DEMO ONLY. Names, scores, facilities, hours, coordinates and detour times are illustrative; not real reviews or provider data.",
+  "source": "simulation-fixture",
+  "stops": [
+    {
+      "id": "gta_plaza_demo",
+      "name": "GTA Demo Plaza (fictional)",
+      "type": "highway-plaza",
+      "region": "GTA",
+      "exitId": "demo-gta",
+      "distanceAlongRouteKm": 55,
+      "isMock": true,
+      "vegetarianVerified": true,
+      "restroomsVerified": true,
+      "parkingVerified": true,
+      "qualityScoreMock": 0.7,
+      "openAtETA": true,
+      "detoursMinutesByCar": {
+        "car_a": 2,
+        "car_b": 3,
+        "car_c": 4
+      }
+    },
+    {
+      "id": "hwy_plaza_demo",
+      "name": "Highway Plaza Demo (fictional)",
+      "type": "highway-plaza",
+      "region": "Eastern Ontario",
+      "exitId": "demo-401-1",
+      "distanceAlongRouteKm": 190,
+      "isMock": true,
+      "vegetarianVerified": false,
+      "restroomsVerified": true,
+      "parkingVerified": true,
+      "qualityScoreMock": 0.3,
+      "openAtETA": true,
+      "detoursMinutesByCar": {
+        "car_a": 0,
+        "car_b": 0,
+        "car_c": 0
+      }
+    },
+    {
+      "id": "veg_cafe_demo",
+      "name": "Vegetarian Café Demo (fictional)",
+      "type": "restaurant",
+      "region": "Eastern Ontario",
+      "exitId": "demo-401-2",
+      "distanceAlongRouteKm": 205,
+      "isMock": true,
+      "vegetarianVerified": true,
+      "restroomsVerified": true,
+      "parkingVerified": true,
+      "qualityScoreMock": 0.88,
+      "openAtETA": true,
+      "detoursMinutesByCar": {
+        "car_a": 8,
+        "car_b": 9,
+        "car_c": 10
+      }
+    },
+    {
+      "id": "chain_demo",
+      "name": "Sandwich Chain Demo (fictional)",
+      "type": "chain-fallback",
+      "region": "Eastern Ontario",
+      "exitId": "demo-401-3",
+      "distanceAlongRouteKm": 235,
+      "isMock": true,
+      "vegetarianVerified": true,
+      "restroomsVerified": null,
+      "parkingVerified": true,
+      "qualityScoreMock": 0.68,
+      "openAtETA": true,
+      "detoursMinutesByCar": {
+        "car_a": 4,
+        "car_b": 5,
+        "car_c": 7
+      }
+    },
+    {
+      "id": "grocery_demo",
+      "name": "Evening Grocery Demo (fictional)",
+      "type": "grocery",
+      "region": "Eastern Ontario",
+      "exitId": "demo-401-4",
+      "distanceAlongRouteKm": 325,
+      "isMock": true,
+      "vegetarianVerified": true,
+      "restroomsVerified": null,
+      "parkingVerified": true,
+      "qualityScoreMock": null,
+      "openAtETA": true,
+      "detoursMinutesByCar": {
+        "car_a": 6,
+        "car_b": 6,
+        "car_c": 8
+      }
+    }
+  ]
+}
