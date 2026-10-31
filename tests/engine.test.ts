@@ -65,8 +65,11 @@ describe("intent parsing", () => {
 });
 
 describe("eligibility", () => {
-  it("excludes GTA stops per config", () => {
-    const { rejected } = evaluateCandidates(stops, makeCars(), hungryIntent, baseConfig, baseTrip, baseEnv);
+  it("excludes GTA stops per config when not urgent", () => {
+    const mild: CollectiveIntent = { ...hungryIntent, hungerLevel: 1, need: ["coffee"] };
+    const earlyCars = makeCars();
+    earlyCars.forEach((c) => (c.progressKm = 20));
+    const { rejected } = evaluateCandidates(stops, earlyCars, mild, baseConfig, baseTrip, baseEnv);
     const gta = rejected.find((r) => r.stopId === "gta_plaza_demo");
     expect(gta?.reasons.join(" ")).toMatch(/excluded region/);
   });
@@ -199,5 +202,58 @@ describe("recommendation builder", () => {
     expect(recs.every((r) => r.mock)).toBe(true);
     expect(recs.every((r) => r.mapsUrl.includes("destination="))).toBe(true);
     expect(recs[0].risks.join(" ")).toMatch(/SIMULATED/);
+  });
+});
+
+describe("agentic improvements", () => {
+  it("negation removes needs", () => {
+    const p = parseIntent("actually no coffee needed");
+    expect(p.removeNeeds).toContain("coffee");
+    expect(p.needs).not.toContain("coffee");
+  });
+
+  it("correction resets hunger", () => {
+    const saved: CollectiveIntent = { need: ["meal"], hungerLevel: 3, dietary: [], maxDetourMinutes: 12, kids: false };
+    const merged = mergeCollectiveIntent(parseIntent("actually, forget it, we're not hungry"), saved);
+    expect(merged.hungerLevel).toBe(0);
+  });
+
+  it("urgent need allows excluded region with soft note", () => {
+    const urgent: CollectiveIntent = { ...hungryIntent, need: ["meal"], hungerLevel: 3 };
+    const earlyCars = makeCars();
+    earlyCars.forEach((c) => (c.progressKm = 20));
+    const { eligible, rejected } = evaluateCandidates(stops, earlyCars, urgent, baseConfig, baseTrip, baseEnv);
+    expect(eligible.map((e) => e.stop.id)).toContain("gta_plaza_demo");
+    expect(rejected.find((r) => r.stopId === "gta_plaza_demo")?.reasons.join(" ")).toMatch(/allowed under urgent need/);
+  });
+
+  it("low-quality-only corridor yields fallback tier with caveat, not silence", () => {
+    const farCars = makeCars();
+    farCars.forEach((c) => (c.progressKm = 260));
+    const noDietCfg = { ...baseConfig, requiredDiet: [] as never[] };
+    const mealOnly: CollectiveIntent = { need: ["meal"], hungerLevel: 2, dietary: [], maxDetourMinutes: 12, kids: false };
+    const { eligible } = evaluateCandidates(stops, farCars, mealOnly, noDietCfg, { ...baseTrip, elapsedMinutes: 200 }, baseEnv);
+    const mealStops = eligible.filter((e) => e.stop.categories.includes("meal"));
+    expect(mealStops.length).toBeGreaterThan(0);
+    expect(mealStops.every((e) => e.tier === "fallback")).toBe(true);
+    const recs = buildRecommendations(eligible, 3);
+    expect(recs.some((r) => r.risks.join(" ").match(/FALLBACK/))).toBe(true);
+  });
+
+  it("result includes explainability trace", () => {
+    const r = decide({ trip: baseTrip, config: baseConfig, cars: makeCars(), collectiveIntent: hungryIntent, environment: baseEnv }, stops, null, "mock", true);
+    expect(r.understood.length).toBeGreaterThan(0);
+    expect(r.verifiedChecks.some((c) => c.includes("freshness"))).toBe(true);
+    expect(r.action).toBe("PROPOSE_STOP");
+  });
+
+  it("bounded exploration noted when only fallback options exist", () => {
+    const farCars = makeCars();
+    farCars.forEach((c) => (c.progressKm = 290));
+    const r = decide(
+      { trip: { ...baseTrip, elapsedMinutes: 200 }, config: { ...baseConfig, requiredDiet: [] }, cars: farCars, collectiveIntent: { need: ["meal"], hungerLevel: 2, dietary: [], maxDetourMinutes: 12, kids: false }, environment: baseEnv },
+      stops, null, "mock", true
+    );
+    expect(r.exploration.join(" ")).toMatch(/fallback|later-exit|near-miss/i);
   });
 });

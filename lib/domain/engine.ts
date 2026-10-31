@@ -72,21 +72,29 @@ export function evaluateCandidates(
   const lead = cars.find((c) => c.role === "lead") ?? cars[0];
   const allNeeds = new Set<Need>([...intent.need, ...cars.flatMap((c) => c.needs)]);
   const requiredDiet = [...new Set([...config.requiredDiet, ...intent.dietary])];
+  const urgent = intent.hungerLevel >= 3 || intent.need.includes("ev_charge");
   const urgentNeeds: Need[] = intent.hungerLevel >= 3 ? [...allNeeds, "meal" as Need] : [...allNeeds];
 
   const eligible: EligibleStop[] = [];
   const rejected: RejectionReason[] = [];
+  const deprioritized: RejectionReason[] = [];
 
   const detourTolerance = env.weather === "rain" || env.weather === "snow" || env.weather === "cold" ? 0.6 : 1;
+  const effectiveMaxDetour = Math.min(config.maximumDetourMinutesPerCar, intent.maxDetourMinutes) * detourTolerance;
 
   for (const stop of stops) {
     const reasons: string[] = [];
+    const soft: string[] = [];
 
     const stale = cars.some((c) => c.positionUpdatedMinutesAgo > LOCATION_FRESHNESS_LIMIT_MIN);
     if (stale) reasons.push("one or more car positions are stale (>3 min); precision degraded");
 
-    if (config.avoidRegion && stop.region === config.avoidRegion && !urgentNeeds.includes("ev_charge")) {
-      reasons.push(`excluded region: ${config.avoidRegion} per trip config`);
+    if (config.avoidRegion && stop.region === config.avoidRegion) {
+      if (urgent) {
+        soft.push(`region ${config.avoidRegion} normally excluded, but allowed under urgent need (${urgentNeeds.join(", ")})`);
+      } else {
+        reasons.push(`excluded region: ${config.avoidRegion} per trip config`);
+      }
     }
     if (trip.elapsedMinutes < config.noOptionalStopsFirstMinutes && intent.hungerLevel < 3) {
       reasons.push(`within no-optional-stops window (first ${config.noOptionalStopsFirstMinutes} min)`);
@@ -118,7 +126,6 @@ export function evaluateCandidates(
       maxDetour = Math.max(maxDetour, detour);
     }
     if (unreachable) reasons.push("unreachable: stop behind one or more cars");
-    const effectiveMaxDetour = Math.min(config.maximumDetourMinutesPerCar, intent.maxDetourMinutes) * detourTolerance;
     if (!unreachable && maxDetour > effectiveMaxDetour) {
       reasons.push(`detour ${maxDetour.toFixed(1)} min exceeds limit ${effectiveMaxDetour.toFixed(1)} min (weather-adjusted)`);
     }
@@ -148,23 +155,47 @@ export function evaluateCandidates(
     const maxDetourNorm = Math.min(maxDetour / Math.max(config.maximumDetourMinutesPerCar, 1), 1);
     const waitNorm = Math.min(maxGroupWait / Math.max(config.maximumRegroupWaitMinutes, 1), 1);
     const unmetNorm = urgentNeeds.length > 0 ? unmet.length / urgentNeeds.length : 0;
+
+    const minutesSinceLast = trip.minutesSinceLastStop ?? trip.elapsedMinutes;
+    const fatigue = Math.min(minutesSinceLast / 180, 1);
+    const darkness = env.daylightMinutes < 60 ? (60 - env.daylightMinutes) / 60 : 0;
+    const kidFactor = intent.kids && stop.restroomsVerified === true ? 0.05 : 0;
+    const trafficRisk = Math.min(env.trafficDelayMinutes / 60, 1) * (stop.type === "highway-plaza" ? 0.1 : 0);
+
     const score =
       1 -
-      (0.35 * maxDetourNorm + 0.25 * waitNorm + 0.25 * qualityPenalty + 0.15 * unmetNorm);
+      (0.3 * maxDetourNorm +
+        0.2 * waitNorm +
+        0.2 * qualityPenalty +
+        0.15 * unmetNorm +
+        0.05 * fatigue +
+        0.05 * darkness * maxDetourNorm +
+        trafficRisk) +
+      kidFactor;
+
+    const tier: EligibleStop["tier"] =
+      stop.qualityScoreMock <= 0.5 || stop.restroomsVerified === false ? "fallback" : "primary";
 
     eligible.push({
       stop,
+      tier,
       minutesAheadForLead,
       detourMinutesByCar: detourByCar,
       arrivalMinutesFromNowByCar: arrivalByCar,
       maxGroupWaitMinutes: maxGroupWait,
-      score,
+      score: Math.max(0, Math.min(1, score)),
       scoreBreakdown: { groupDetour: maxDetourNorm, maxWait: waitNorm, quality: qualityPenalty, unmetNeeds: unmetNorm }
     });
+    if (soft.length > 0) {
+      deprioritized.push({ stopId: stop.id, reasons: soft });
+    }
   }
 
-  eligible.sort((a, b) => b.score - a.score);
-  return { eligible, rejected };
+  eligible.sort((a, b) => {
+    if (a.tier !== b.tier) return a.tier === "primary" ? -1 : 1;
+    return b.score - a.score;
+  });
+  return { eligible, rejected: [...rejected, ...deprioritized.filter((d) => !rejected.some((r) => r.stopId === d.stopId))] };
 }
 
 export function deriveTriggerReasons(
@@ -190,10 +221,12 @@ function pickKinds(rank: number): RecommendationKind {
 }
 
 export function buildRecommendations(eligible: EligibleStop[], limit = 3): Recommendation[] {
-  const top = eligible.slice(0, limit);
+  const primary = eligible.filter((e) => e.tier === "primary");
+  const top = (primary.length >= 2 ? primary : eligible).slice(0, limit);
   return top.map((e, i) => {
     const risks: string[] = [];
     if (e.stop.isMock) risks.push("SIMULATED fixture data — not a real business or live rating");
+    if (e.tier === "fallback") risks.push("FALLBACK: lower quality or unverified facilities — best available given constraints; consider deferring if not urgent");
     if (e.stop.restroomsVerified !== true) risks.push("restroom availability unverified");
     if (e.stop.congestionNoteMock) risks.push(e.stop.congestionNoteMock);
     if (e.maxGroupWaitMinutes > 0) risks.push(`cars arrive ${e.maxGroupWaitMinutes.toFixed(0)} min apart; regroup wait applies`);
@@ -231,12 +264,24 @@ export function decide(
   const triggers = deriveTriggerReasons(collectiveIntent, config, trip, environment);
   const { eligible, rejected } = evaluateCandidates(stops, cars, collectiveIntent, config, trip, environment);
 
+  const understood = buildUnderstoodSummary(request);
+  const verifiedChecks = buildVerifiedChecks(request, eligible, rejected);
+  let exploration: string[] = [];
+
+  const primaryCount = eligible.filter((e) => e.tier === "primary").length;
+  if (triggers.length > 0 && eligible.length > 0 && primaryCount < 2) {
+    exploration = exploreAlternatives(eligible, rejected, request);
+  }
+
   if (triggers.length === 0 || eligible.length === 0) {
     return {
       action: "STAY_SILENT",
       recommendations: [],
       rejected,
       triggerReasons: triggers,
+      understood,
+      exploration,
+      verifiedChecks,
       provider: providerName,
       isMock: isMockProvider,
       decidedAtLocal: trip.localTime
@@ -274,8 +319,68 @@ export function decide(
     recommendations,
     rejected,
     triggerReasons: triggers,
+    understood,
+    exploration,
+    verifiedChecks,
     provider: providerName,
     isMock: isMockProvider,
     decidedAtLocal: trip.localTime
   };
+}
+
+function buildUnderstoodSummary(request: import("./types").RecommendStopsRequest): string[] {
+  const { collectiveIntent: intent, environment: env, trip, cars } = request;
+  const out: string[] = [];
+  if (intent.need.length) out.push(`needs: ${intent.need.join(", ")}`);
+  if (intent.hungerLevel > 0) out.push(`hunger level ${intent.hungerLevel}/3${intent.hungerLevel >= 3 ? " (urgent)" : ""}`);
+  if (intent.dietary.length) out.push(`dietary: ${intent.dietary.join(", ")}`);
+  if (intent.kids) out.push("children in group — restroom priority");
+  const evCars = cars.filter((c) => c.ev);
+  if (evCars.length) {
+    out.push(`EV: ${evCars.map((c) => `${c.id} ${c.connector ?? "?"} @ ${c.batteryPercent ?? "?"}%`).join("; ")}`);
+  }
+  out.push(`weather ${env.weather}, traffic +${env.trafficDelayMinutes} min, daylight left ${env.daylightMinutes} min`);
+  if (trip.minutesSinceLastStop != null) out.push(`last stop ${trip.minutesSinceLastStop} min ago`);
+  return out;
+}
+
+function buildVerifiedChecks(
+  request: import("./types").RecommendStopsRequest,
+  eligible: EligibleStop[],
+  rejected: RejectionReason[]
+): string[] {
+  const checks: string[] = [];
+  checks.push(`${eligible.length} candidate(s) passed all hard checks (${eligible.map((e) => e.stop.id).join(", ") || "none"})`);
+  checks.push(`${rejected.length} candidate(s) rejected with reasons`);
+  const stale = request.cars.some((c) => c.positionUpdatedMinutesAgo > LOCATION_FRESHNESS_LIMIT_MIN);
+  checks.push(stale ? "position freshness: DEGRADED (>3 min)" : "position freshness: OK (<=3 min)");
+  checks.push(`lead-time check: min ${request.config.advanceNoticeMinutes} min notice enforced`);
+  checks.push(`detour cap: ${request.config.maximumDetourMinutesPerCar} min/car (weather-adjusted)`);
+  checks.push(`group wait cap: ${request.config.maximumRegroupWaitMinutes} min`);
+  return checks;
+}
+
+function exploreAlternatives(
+  eligible: EligibleStop[],
+  rejected: RejectionReason[],
+  request: import("./types").RecommendStopsRequest
+): string[] {
+  const notes: string[] = [];
+  const farther = eligible.filter((e) => e.minutesAheadForLead > 30);
+  if (farther.length > 0) {
+    notes.push(`investigated ${farther.length} later-exit option(s): ${farther.map((e) => `${e.stop.id} (${e.minutesAheadForLead.toFixed(0)} min ahead)`).join(", ")}`);
+  }
+  const lowQuality = eligible.filter((e) => e.tier === "fallback");
+  if (lowQuality.length > 0) {
+    notes.push(`only fallback-grade options available (${lowQuality.map((e) => e.stop.id).join(", ")}); surfaced with caveat instead of staying silent`);
+  }
+  const nearMiss = rejected.filter((r) => r.reasons.some((rsn) => rsn.includes("detour") || rsn.includes("lead time")));
+  if (nearMiss.length > 0 && nearMiss.length <= 2) {
+    notes.push(`checked ${nearMiss.length} near-miss candidate(s) that failed detour/lead-time only: ${nearMiss.map((r) => r.stopId).join(", ")}`);
+  }
+  if (eligible.some((e) => e.stop.chargers?.length)) {
+    notes.push("verified EV+meal bundle available: " + eligible.filter((e) => e.stop.chargers?.length).map((e) => e.stop.id).join(", "));
+  }
+  if (notes.length === 0) notes.push("no additional options warranted investigation");
+  return notes;
 }

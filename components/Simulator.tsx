@@ -93,7 +93,8 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
           direction: "eastbound" as const,
           highway: "401",
           elapsedMinutes: Math.round(sim.elapsedMinutes),
-          localTime: sim.localTime
+          localTime: sim.localTime,
+          minutesSinceLastStop: Math.round(sim.elapsedMinutes)
         },
         config: { ...sc.config },
         cars: cars.map(({ lat, lng, ...c }) => c),
@@ -149,9 +150,14 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
     const parsed = parseIntent(text);
     const merged = mergeCollectiveIntent(parsed, baseIntent);
     setNeeds(merged.need);
-    if (parsed.hungerLevel > hunger) setHunger(parsed.hungerLevel);
+    if (parsed.resetHunger) setHunger(0);
+    else if (parsed.hungerLevel > hunger) setHunger(parsed.hungerLevel);
     setChat("");
-    pushLog({ time: sim.localTime, text: `Chat: "${text}" → needs [${parsed.needs.join(", ") || "none"}], hunger ${parsed.hungerLevel}`, kind: "trigger" });
+    pushLog({
+      time: sim.localTime,
+      text: `Chat: "${text}" → needs [${merged.need.join(", ") || "none"}]${parsed.removeNeeds.length ? `, removed [${parsed.removeNeeds.join(", ")}]` : ""}${parsed.resetHunger ? ", hunger reset" : ""}, hunger ${parsed.resetHunger ? 0 : parsed.hungerLevel}`,
+      kind: "trigger"
+    });
     void runRecommendation(merged, "Chat intent applied.");
   };
 
@@ -356,14 +362,36 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
             </pre>
           )}
           {result && (
-            <div className="mt-3">
-              <h3 className="text-sm font-bold text-navy">Why / rejections</h3>
-              <p className="mt-1 text-xs text-slate-500">Triggers: {result.triggerReasons.join("; ") || "none"} · provider: {result.provider}</p>
-              <ul className="mt-2 space-y-1 text-xs text-slate-600">
-                {result.rejected.map((r) => (
-                  <li key={r.stopId}><strong>{r.stopId}</strong>: {r.reasons.join("; ")}</li>
-                ))}
-              </ul>
+            <div className="mt-3 space-y-3">
+              <div>
+                <h3 className="text-sm font-bold text-navy">What the agent understood</h3>
+                <ul className="mt-1 space-y-0.5 text-xs text-slate-600">
+                  {result.understood.map((u) => <li key={u}>• {u}</li>)}
+                </ul>
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-navy">Verified checks</h3>
+                <ul className="mt-1 space-y-0.5 text-xs text-slate-600">
+                  {result.verifiedChecks.map((u) => <li key={u}>✓ {u}</li>)}
+                </ul>
+              </div>
+              {result.exploration.length > 0 && (
+                <div>
+                  <h3 className="text-sm font-bold text-navy">Explored alternatives</h3>
+                  <ul className="mt-1 space-y-0.5 text-xs text-slate-600">
+                    {result.exploration.map((u) => <li key={u}>• {u}</li>)}
+                  </ul>
+                </div>
+              )}
+              <div>
+                <h3 className="text-sm font-bold text-navy">Why / rejections</h3>
+                <p className="mt-1 text-xs text-slate-500">Triggers: {result.triggerReasons.join("; ") || "none"} · provider: {result.provider}</p>
+                <ul className="mt-2 space-y-1 text-xs text-slate-600">
+                  {result.rejected.map((r) => (
+                    <li key={r.stopId}><strong>{r.stopId}</strong>: {r.reasons.join("; ")}</li>
+                  ))}
+                </ul>
+              </div>
             </div>
           )}
         </div>

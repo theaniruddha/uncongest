@@ -25,6 +25,7 @@ export interface TripContext {
   highway: string;
   elapsedMinutes: number;
   localTime: string;
+  minutesSinceLastStop?: number;
 }
 
 export interface CollectiveIntent {
@@ -89,6 +90,7 @@ export interface RejectionReason {
 
 export interface EligibleStop {
   stop: StopCandidate;
+  tier: "primary" | "fallback";
   minutesAheadForLead: number;
   detourMinutesByCar: Record<string, number>;
   arrivalMinutesFromNowByCar: Record<string, number>;
@@ -124,6 +126,9 @@ export interface EngineResult {
   recommendations: Recommendation[];
   rejected: RejectionReason[];
   triggerReasons: string[];
+  understood: string[];
+  exploration: string[];
+  verifiedChecks: string[];
   provider: string;
   isMock: boolean;
   decidedAtLocal: string;
