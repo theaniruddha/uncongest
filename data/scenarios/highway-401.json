@@ -1,0 +1,128 @@
+{
+  "id": "hwy401-three-cars",
+  "name": "401 Group Dinner Before Dark",
+  "mode": "SIMULATED",
+  "timezone": "America/Toronto",
+  "origin": "Toronto, ON",
+  "destination": "Montréal, QC",
+  "routeDescription": "Highway 401 eastbound; geometry and candidate data are illustrative, not official routing",
+  "routeAnchorPoints": [
+    [
+      -79.3832,
+      43.6532
+    ],
+    [
+      -79.015,
+      43.87
+    ],
+    [
+      -78.16,
+      43.96
+    ],
+    [
+      -77.87,
+      44.02
+    ],
+    [
+      -76.5,
+      44.23
+    ],
+    [
+      -75.7,
+      44.58
+    ],
+    [
+      -74.74,
+      45.01
+    ],
+    [
+      -73.5673,
+      45.5019
+    ]
+  ],
+  "departureLocal": "2026-10-31T13:00:00-04:00",
+  "config": {
+    "carCount": 3,
+    "avoidRegion": "GTA",
+    "noOptionalStopsFirstMinutes": 60,
+    "maximumDetourMinutesPerCar": 12,
+    "maximumRegroupWaitMinutes": 15,
+    "advanceNoticeMinutes": 10,
+    "requiredDiet": [
+      "vegetarian"
+    ],
+    "groceriesCompleted": false,
+    "passengerLed": true
+  },
+  "cars": [
+    {
+      "id": "car_a",
+      "label": "Car A",
+      "role": "lead",
+      "virtualStartProgressKm": 75,
+      "drivingFactor": 1.02,
+      "needs": [
+        "restroom"
+      ]
+    },
+    {
+      "id": "car_b",
+      "label": "Car B",
+      "virtualStartProgressKm": 63,
+      "drivingFactor": 1,
+      "needs": [
+        "dinner"
+      ]
+    },
+    {
+      "id": "car_c",
+      "label": "Car C",
+      "virtualStartProgressKm": 52,
+      "drivingFactor": 0.98,
+      "needs": [
+        "dinner"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "minute": 0,
+      "type": "DEPART",
+      "description": "Optional stops inside GTA excluded"
+    },
+    {
+      "minute": 75,
+      "type": "GROUP_SPREAD",
+      "description": "Cars have different ETAs"
+    },
+    {
+      "minute": 110,
+      "type": "DINNER_DUE_SOON",
+      "description": "Vegetarian dinner due, request suitable stop candidates"
+    },
+    {
+      "minute": 140,
+      "type": "EXIT_WINDOW",
+      "description": "Lead car approaching a candidate; warn early or reject"
+    },
+    {
+      "minute": 220,
+      "type": "WEATHER_SHIFT",
+      "temperatureC": 2,
+      "description": "Cold weather forecast at upcoming arrival"
+    },
+    {
+      "minute": 230,
+      "type": "SUNSET_APPROACHING",
+      "minutesToSunset": 40,
+      "description": "Suggest groceries only if unfinished"
+    }
+  ],
+  "assertions": [
+    "Do not recommend optional GTA stops",
+    "Exclude unverified vegetarian suitability where restriction is hard",
+    "Do not issue late-exit or speed-control advice",
+    "Re-evaluate grocery recommendation when completed",
+    "Stay silent when no material trigger"
+  ]
+}
