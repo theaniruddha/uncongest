@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UncongestDecision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "stopId",
+    "reason",
+    "notify",
+    "requiresApproval",
+    "audience",
+    "speakMessage"
+  ],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "STAY_SILENT",
+        "PROPOSE_STOP",
+        "REPLAN",
+        "ESCALATE_TO_PASSENGER"
+      ]
+    },
+    "stopId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 600
+    },
+    "notify": {
+      "type": "boolean"
+    },
+    "requiresApproval": {
+      "type": "boolean"
+    },
+    "audience": {
+      "type": "string",
+      "enum": [
+        "GROUP_LEAD",
+        "PASSENGERS",
+        "SOLO"
+      ]
+    },
+    "speakMessage": {
+      "type": "string",
+      "maxLength": 300
+    }
+  }
+}
