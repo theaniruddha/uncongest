@@ -2,11 +2,15 @@
 
 import scenario from "@/data/scenarios/highway-401.json";
 import stopsFixture from "@/data/stops/highway-401.mock.json";
+import extendedFixture from "@/data/stops/highway-401.extended.mock.json";
 import type { CarState, StopCandidate } from "@/lib/domain/types";
 import { routePointAtKm } from "@/lib/simulator/simulator";
 
 const pts = scenario.routeAnchorPoints as Array<[number, number]>;
-const stops = (stopsFixture as { stops: StopCandidate[] }).stops;
+const stops = [
+  ...(stopsFixture as { stops: StopCandidate[] }).stops,
+  ...(extendedFixture as { stops: StopCandidate[] }).stops
+];
 
 function project(lat: number, lng: number): [number, number] {
   const xs = pts.map((p) => p[0]);

@@ -1,5 +1,6 @@
 import type {
   CarState,
+  Dietary,
   CollectiveIntent,
   EligibleStop,
   EngineResult,
@@ -22,6 +23,12 @@ export function mapsUrlFor(lat: number, lng: number, name: string): string {
   return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}&destination_place_name=${label}`;
 }
 
+export function addMinutesToLocalTime(localTime: string, minutes: number): string {
+  const [h, m] = localTime.split(":").map(Number);
+  const total = ((h * 60 + m + Math.round(minutes)) % 1440 + 1440) % 1440;
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
 export function isOpenAt(stop: StopCandidate, localTime: string): { open: boolean; note?: string } {
   if (stop.open24h) return { open: true };
   const [h, m] = localTime.split(":").map(Number);
@@ -39,12 +46,10 @@ export function isOpenAt(stop: StopCandidate, localTime: string): { open: boolea
   };
 }
 
-function meetsHardDiet(stop: StopCandidate, required: string[]): boolean {
+function meetsHardDiet(stop: StopCandidate, required: Dietary[]): boolean {
   if (required.length === 0) return true;
-  if (required.includes("vegetarian") || required.includes("vegan")) {
-    return stop.vegetarianVerified === true;
-  }
-  return true;
+  const verified = stop.dietaryVerified ?? (stop.vegetarianVerified === true ? ["vegetarian" as Dietary] : []);
+  return required.every((d) => verified.includes(d));
 }
 
 function chargerCompatible(stop: StopCandidate, cars: CarState[]): boolean {
@@ -79,7 +84,7 @@ export function evaluateCandidates(
   const rejected: RejectionReason[] = [];
   const deprioritized: RejectionReason[] = [];
 
-  const detourTolerance = env.weather === "rain" || env.weather === "snow" || env.weather === "cold" ? 0.6 : 1;
+  const detourTolerance = !urgent && (env.weather === "rain" || env.weather === "snow" || env.weather === "cold") ? 0.6 : 1;
   const effectiveMaxDetour = Math.min(config.maximumDetourMinutesPerCar, intent.maxDetourMinutes) * detourTolerance;
 
   for (const stop of stops) {
@@ -142,7 +147,8 @@ export function evaluateCandidates(
     if (urgentNeeds.includes("ev_charge") && !chargerCompatible(stop, cars)) {
       reasons.push("no verified compatible charger for an EV in the group");
     }
-    const open = isOpenAt(stop, trip.localTime);
+    const arrivalLocal = addMinutesToLocalTime(trip.localTime, minutesAheadForLead);
+    const open = isOpenAt(stop, arrivalLocal);
     if (!open.open) reasons.push(open.note ?? "closed at ETA");
 
     if (reasons.length > 0) {
@@ -156,8 +162,7 @@ export function evaluateCandidates(
     const waitNorm = Math.min(maxGroupWait / Math.max(config.maximumRegroupWaitMinutes, 1), 1);
     const unmetNorm = urgentNeeds.length > 0 ? unmet.length / urgentNeeds.length : 0;
 
-    const minutesSinceLast = trip.minutesSinceLastStop ?? trip.elapsedMinutes;
-    const fatigue = Math.min(minutesSinceLast / 180, 1);
+    const fatigue = trip.minutesSinceLastStop != null ? Math.min(trip.minutesSinceLastStop / 180, 1) : 0;
     const darkness = env.daylightMinutes < 60 ? (60 - env.daylightMinutes) / 60 : 0;
     const kidFactor = intent.kids && stop.restroomsVerified === true ? 0.05 : 0;
     const trafficRisk = Math.min(env.trafficDelayMinutes / 60, 1) * (stop.type === "highway-plaza" ? 0.1 : 0);
@@ -220,9 +225,15 @@ function pickKinds(rank: number): RecommendationKind {
   return rank === 0 ? "BEST_FIT" : rank === 1 ? "FASTEST" : "ALTERNATIVE";
 }
 
-export function buildRecommendations(eligible: EligibleStop[], limit = 3): Recommendation[] {
-  const primary = eligible.filter((e) => e.tier === "primary");
-  const top = (primary.length >= 2 ? primary : eligible).slice(0, limit);
+export function buildRecommendations(eligible: EligibleStop[], limit = 3, urgency: 0 | 1 | 2 | 3 = 0): Recommendation[] {
+  const urgencyScore = (e: EligibleStop) => e.score + (1 - e.scoreBreakdown.groupDetour) * 0.35 + (1 - e.scoreBreakdown.unmetNeeds) * 0.1;
+  const ranked = [...eligible].sort((a, b) => {
+    if (urgency >= 3) return urgencyScore(b) - urgencyScore(a);
+    if (a.tier !== b.tier) return a.tier === "primary" ? -1 : 1;
+    return b.score - a.score;
+  });
+  const primary = ranked.filter((e) => e.tier === "primary");
+  const top = urgency >= 3 ? ranked.slice(0, limit) : (primary.length >= 2 ? primary : ranked).slice(0, limit);
   return top.map((e, i) => {
     const risks: string[] = [];
     if (e.stop.isMock) risks.push("SIMULATED fixture data — not a real business or live rating");
@@ -258,20 +269,16 @@ export function decide(
   stops: StopCandidate[],
   llmPick: { action?: string; picks: Array<{ stopId: string; reason: string; tradeoffs: string[]; kind?: string }>; speakMessage?: string } | null,
   providerName: string,
-  isMockProvider: boolean
+  isMockProvider: boolean,
+  precomputed?: { eligible: EligibleStop[]; rejected: RejectionReason[]; exploration: string[] }
 ): EngineResult {
   const { trip, config, cars, collectiveIntent, environment } = request;
   const triggers = deriveTriggerReasons(collectiveIntent, config, trip, environment);
-  const { eligible, rejected } = evaluateCandidates(stops, cars, collectiveIntent, config, trip, environment);
+  const { eligible, rejected } = precomputed ?? evaluateCandidates(stops, cars, collectiveIntent, config, trip, environment);
 
   const understood = buildUnderstoodSummary(request);
   const verifiedChecks = buildVerifiedChecks(request, eligible, rejected);
-  let exploration: string[] = [];
-
-  const primaryCount = eligible.filter((e) => e.tier === "primary").length;
-  if (triggers.length > 0 && eligible.length > 0 && primaryCount < 2) {
-    exploration = exploreAlternatives(eligible, rejected, request);
-  }
+  const exploration: string[] = precomputed?.exploration ?? [];
 
   if (triggers.length === 0 || eligible.length === 0) {
     return {
@@ -311,7 +318,7 @@ export function decide(
     });
     }
   } else {
-    recommendations = buildRecommendations(eligible, 3);
+    recommendations = buildRecommendations(eligible, 3, collectiveIntent.hungerLevel);
   }
 
   return {
@@ -360,27 +367,115 @@ function buildVerifiedChecks(
   return checks;
 }
 
-function exploreAlternatives(
-  eligible: EligibleStop[],
-  rejected: RejectionReason[],
-  request: import("./types").RecommendStopsRequest
-): string[] {
+import type { PlaceProvider } from "@/lib/providers/places";
+
+export interface ExplorationOutcome {
+  exploration: string[];
+  eligible: EligibleStop[];
+  rejected: RejectionReason[];
+  discoveredStopIds: string[];
+}
+
+export async function exploreNextExits(
+  request: import("./types").RecommendStopsRequest,
+  initial: { eligible: EligibleStop[]; rejected: RejectionReason[] },
+  allInitialStops: StopCandidate[],
+  placeProvider: PlaceProvider
+): Promise<ExplorationOutcome> {
+  const { cars, collectiveIntent } = request;
+  const lead = cars.find((c) => c.role === "lead") ?? cars[0];
   const notes: string[] = [];
-  const farther = eligible.filter((e) => e.minutesAheadForLead > 30);
-  if (farther.length > 0) {
-    notes.push(`investigated ${farther.length} later-exit option(s): ${farther.map((e) => `${e.stop.id} (${e.minutesAheadForLead.toFixed(0)} min ahead)`).join(", ")}`);
+  const primaryCount = initial.eligible.filter((e) => e.tier === "primary").length;
+
+  const windowMin = lead.progressKm + 1;
+  const windowMax = lead.progressKm + 130;
+  const needs = [...new Set([...collectiveIntent.need, ...cars.flatMap((c) => c.needs)])];
+
+  const discovered = await placeProvider.getCandidates("nextExits", {
+    minKm: windowMin,
+    maxKm: windowMax,
+    needs
+  });
+  notes.push(
+    `second search: place provider "${placeProvider.name}" pass=nextExits over ${windowMin.toFixed(0)}–${windowMax.toFixed(0)} km ahead (next 1–2 exits beyond initial window), needs [${needs.join(", ") || "none"}] → ${discovered.length} raw candidate(s)`
+  );
+
+  const { eligible: newEligible, rejected: newRejected } = evaluateCandidates(
+    discovered,
+    cars,
+    collectiveIntent,
+    request.config,
+    request.trip,
+    request.environment
+  );
+  const discoveredStopIds = newEligible.map((e) => e.stop.id);
+  if (newEligible.length > 0) {
+    notes.push(`validated ${newEligible.length} newly discovered candidate(s): ${discoveredStopIds.join(", ")}`);
   }
-  const lowQuality = eligible.filter((e) => e.tier === "fallback");
-  if (lowQuality.length > 0) {
-    notes.push(`only fallback-grade options available (${lowQuality.map((e) => e.stop.id).join(", ")}); surfaced with caveat instead of staying silent`);
+  if (newRejected.length > 0) {
+    notes.push(`rejected ${newRejected.length} newly discovered candidate(s): ${newRejected.map((r) => `${r.stopId} (${r.reasons[0]})`).join("; ")}`);
   }
-  const nearMiss = rejected.filter((r) => r.reasons.some((rsn) => rsn.includes("detour") || rsn.includes("lead time")));
-  if (nearMiss.length > 0 && nearMiss.length <= 2) {
-    notes.push(`checked ${nearMiss.length} near-miss candidate(s) that failed detour/lead-time only: ${nearMiss.map((r) => r.stopId).join(", ")}`);
+
+  const mergedEligible = [...initial.eligible, ...newEligible].sort((a, b) => {
+    if (a.tier !== b.tier) return a.tier === "primary" ? -1 : 1;
+    return b.score - a.score;
+  });
+  const mergedRejected = [...initial.rejected, ...newRejected];
+
+  const beforeTop = initial.eligible[0]?.stop.id ?? null;
+  const afterTop = mergedEligible[0]?.stop.id ?? null;
+  if (beforeTop && afterTop && beforeTop !== afterTop) {
+    notes.push(`comparison changed the top recommendation: ${beforeTop} → ${afterTop}`);
+  } else if (afterTop) {
+    notes.push(`comparison confirmed ${afterTop} as top recommendation`);
   }
-  if (eligible.some((e) => e.stop.chargers?.length)) {
-    notes.push("verified EV+meal bundle available: " + eligible.filter((e) => e.stop.chargers?.length).map((e) => e.stop.id).join(", "));
+  if (primaryCount < 2 && initial.eligible.length > 0) {
+    notes.push("initial options were thin (<2 primary); second search was warranted");
   }
-  if (notes.length === 0) notes.push("no additional options warranted investigation");
-  return notes;
+  return { exploration: notes, eligible: mergedEligible, rejected: mergedRejected, discoveredStopIds };
+}
+
+export async function decideWithExploration(
+  request: import("./types").RecommendStopsRequest,
+  placeProvider: PlaceProvider,
+  providerName: string,
+  isMockProvider: boolean,
+  llmResolver?: (ctx: {
+    eligible: EligibleStop[];
+    rejected: RejectionReason[];
+    triggerReasons: string[];
+  }) => Promise<{ action?: string; picks: Array<{ stopId: string; reason: string; tradeoffs: string[]; kind?: string }>; speakMessage?: string } | null>
+): Promise<EngineResult> {
+  const initialStops = await placeProvider.getCandidates("initial", {
+    minKm: 0,
+    maxKm: 1000,
+    needs: request.collectiveIntent.need
+  });
+  const initial = evaluateCandidates(initialStops, request.cars, request.collectiveIntent, request.config, request.trip, request.environment);
+  const triggers = deriveTriggerReasons(request.collectiveIntent, request.config, request.trip, request.environment);
+
+  const primaryCount = initial.eligible.filter((e) => e.tier === "primary").length;
+  let eligible = initial.eligible;
+  let rejected = initial.rejected;
+  let exploration: string[] = [];
+
+  const needsExploration = triggers.length > 0 && (initial.eligible.length === 0 || primaryCount < 2);
+  if (needsExploration) {
+    const outcome = await exploreNextExits(request, initial, initialStops, placeProvider);
+    exploration = outcome.exploration;
+    eligible = outcome.eligible;
+    rejected = outcome.rejected;
+  } else {
+    exploration = ["initial search sufficient — second pass not warranted"];
+  }
+
+  let llmPick = null;
+  if (llmResolver && (triggers.length === 0 || eligible.length > 0)) {
+    try {
+      llmPick = await llmResolver({ eligible, rejected, triggerReasons: triggers });
+    } catch {
+      llmPick = null;
+    }
+  }
+  return decide(request, initialStops, llmPick, providerName, isMockProvider, { eligible, rejected, exploration });
 }

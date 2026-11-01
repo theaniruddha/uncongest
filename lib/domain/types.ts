@@ -71,6 +71,7 @@ export interface StopCandidate {
   lng: number;
   isMock: true;
   vegetarianVerified: boolean | null;
+  dietaryVerified?: Dietary[];
   restroomsVerified: boolean | null;
   parkingVerified: boolean | null;
   qualityScoreMock: number;
