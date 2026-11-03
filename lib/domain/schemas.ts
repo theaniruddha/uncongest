@@ -24,7 +24,7 @@ export const carSchema = z.object({
 
 export const tripContextSchema = z.object({
   destination: z.string().min(1),
-  direction: z.enum(["eastbound", "westbound"]),
+  direction: z.string().min(1).max(40),
   highway: z.string().min(1),
   elapsedMinutes: z.number().min(0),
   localTime: z.string().regex(/^\d{2}:\d{2}$/),

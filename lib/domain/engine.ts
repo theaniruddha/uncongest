@@ -293,6 +293,10 @@ export function buildRecommendations(eligible: EligibleStop[], limit = 3, urgenc
   return top.map((e, i) => {
     const risks: string[] = [];
     if (e.stop.isMock) risks.push("SIMULATED fixture data — not a real business or live rating");
+    else {
+      risks.push(`real place from ${e.stop.source === "tomtom" ? "TomTom" : "OpenStreetMap"}${e.stop.provenance === "cached" ? " (cached)" : ""} — menu, restroom access and rating not verified`);
+      if (!e.stop.hoursVerified) risks.push("opening hours unverified — check before you go");
+    }
     if (e.tier === "fallback") risks.push("FALLBACK: lower quality or unverified facilities — best available given constraints; consider deferring if not urgent");
     if (e.stop.restroomsVerified !== true) risks.push("restroom availability unverified");
     if (e.stop.congestionNoteMock) risks.push(e.stop.congestionNoteMock);
@@ -315,7 +319,8 @@ export function buildRecommendations(eligible: EligibleStop[], limit = 3, urgenc
       risks,
       mapsUrl: mapsUrlFor(e.stop.lat, e.stop.lng, e.stop.name),
       requiresApproval: true,
-      mock: true
+      mock: e.stop.isMock,
+      source: e.stop.source ?? "fixture"
     };
   });
 }

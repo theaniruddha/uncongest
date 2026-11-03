@@ -24,7 +24,7 @@ export interface CarState {
 
 export interface TripContext {
   destination: string;
-  direction: "eastbound" | "westbound";
+  direction: string;
   highway: string;
   elapsedMinutes: number;
   localTime: string;
@@ -79,7 +79,19 @@ export interface StopCandidate {
   distanceAlongRouteKm: number;
   lat: number;
   lng: number;
-  isMock: true;
+  /** true = fictional fixture (demo mode). Real places (OSM/TomTom) are false. */
+  isMock: boolean;
+  /** Where this candidate came from. Absent on legacy fixtures (= "fixture"). */
+  source?: "fixture" | "osm" | "tomtom";
+  provenance?: "live" | "cached" | "fixture";
+  fetchedAt?: string;
+  osmId?: string;
+  brand?: string;
+  /** Raw OSM opening_hours (or provider text); unparsed hours are "unverified", never assumed. */
+  openingHoursRaw?: string;
+  hoursVerified?: boolean;
+  /** Straight-line distance from the route to the place, km. */
+  offRouteKm?: number;
   vegetarianVerified: boolean | null;
   /**
    * How veg-friendly the menu is (meal stops only). Vegetarian/vegan is a preference, not a filter:
@@ -135,7 +147,8 @@ export interface Recommendation {
   risks: string[];
   mapsUrl: string;
   requiresApproval: boolean;
-  mock: true;
+  mock: boolean;
+  source?: "fixture" | "osm" | "tomtom";
 }
 
 export interface EngineResult {
