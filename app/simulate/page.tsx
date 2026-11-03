@@ -11,7 +11,7 @@ export default function SimulatePage({ searchParams }: { searchParams: { demo?: 
       <header className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
         <Link href="/" className="focus-ring text-lg font-bold text-navy">Uncongest</Link>
         <span className="rounded-full bg-amber/15 px-3 py-1 text-xs font-semibold text-amber">
-          SIMULATION — synthetic data, no live APIs
+          SIMULATED trip · real route &amp; exits (OSM) · live weather optional · fictional businesses
         </span>
       </header>
       <Simulator autoDemo={searchParams.demo === "1"} />

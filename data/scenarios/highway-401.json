@@ -4,7 +4,7 @@
   "mode": "SIMULATED",
   "timezone": "America/Toronto",
   "origin": "Toronto, ON",
-  "destination": "Montréal, QC",
+  "destination": "Montr\u00e9al, QC",
   "routeDescription": "Highway 401 eastbound; geometry and candidate data are illustrative, not official routing",
   "routeAnchorPoints": [
     [
@@ -68,20 +68,22 @@
     {
       "id": "car_b",
       "label": "Car B",
-      "virtualStartProgressKm": 63,
+      "virtualStartProgressKm": 70,
       "drivingFactor": 1,
       "needs": [
-        "dinner"
-      ]
+        "meal"
+      ],
+      "role": "passenger"
     },
     {
       "id": "car_c",
       "label": "Car C",
-      "virtualStartProgressKm": 52,
+      "virtualStartProgressKm": 65,
       "drivingFactor": 0.98,
       "needs": [
-        "dinner"
-      ]
+        "meal"
+      ],
+      "role": "passenger"
     }
   ],
   "events": [

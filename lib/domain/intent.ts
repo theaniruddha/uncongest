@@ -29,6 +29,7 @@ export interface ParsedIntent {
   dietary: Dietary[];
   clearDietary: boolean;
   resetHunger: boolean;
+  corrected: boolean;
   explicit: boolean;
 }
 
@@ -75,6 +76,7 @@ export function parseIntent(text: string): ParsedIntent {
     dietary: [...dietary],
     clearDietary: ALLERGY_CLEAR.test(lower),
     resetHunger: corrected || NOT_HUNGRY.test(lower),
+    corrected,
     explicit: needs.size > 0 || removeNeeds.size > 0 || dietary.size > 0 || hungerLevel > 0 || corrected
   };
 }

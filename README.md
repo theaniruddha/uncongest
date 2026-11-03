@@ -34,17 +34,33 @@ Simulate three cars traveling Toronto → Montréal. One car has children, the g
 Next.js App Router / TypeScript / Tailwind / shadcn/ui / Mapbox GL JS (optional MapLibre/OSM demo fallback), Supabase PostgreSQL + Realtime when enabled, Zod, Vitest, Playwright, Mistral or a configurable hackathon model provider, Open-Meteo.
 
 ## Run and development
-The repository is **specification-first**. Mistral Vibe will scaffold the executable Next.js app. After scaffolding, expected commands are `npm install`, `npm run dev`, `npm run test`, `npm run build`, and `npm run test:e2e`. See [the build prompt](prompts/VIBE_MASTER_PROMPT.md).
+```bash
+npm install
+npm run dev          # http://localhost:3000/simulate  (works offline with AI_PROVIDER=mock)
+npm run test         # Vitest unit + route-handler contract tests
+npm run test:e2e     # Playwright in system Chrome; starts its own mock-AI server on :3124
+npm run typecheck && npm run build
+```
+`.env` (never committed): `AI_PROVIDER=mock|meta|mistral`. For Meta Muse set `MODEL_API_KEY` (or `MUSE_API_KEY`); optional
+`AI_MODEL` (default `muse-spark-1.3`), `META_DECISION_REASONING_EFFORT` (default `medium`), `META_INTENT_REASONING_EFFORT`
+(default `low`), `META_MAX_OUTPUT_TOKENS`, `META_TIMEOUT_MS`, `LLM_MAX_CALLS_PER_10_MIN` (default 30, process-wide cost guard).
+Regenerate the cached route/exit fixture with `node scripts/build-route-fixture.mjs` (one-off; the app never calls OSRM/Overpass at runtime).
 
-**Never commit API keys, credentials, precise live location traces, or real traveler identities.** Demo data is synthetic; mock review quality and candidate locations are *not* claims about real businesses.
+**Never commit API keys, credentials, precise live location traces, or real traveler identities.** Stop businesses are fictional; their *locations and exit numbers* are real.
 
 ## Current status
-**Working MVP implemented.** `npm install && npm run dev` starts a fully offline demo (no API keys required):
+**Architecture: two bounded agents + deterministic context layer + deterministic watcher.**
 
-- `POST /api/recommend-stops` — the reusable engine endpoint: Zod-validated collective trip snapshot in, 2–3 ranked, explained stop recommendations out (or `STAY_SILENT`).
-- `/simulate` — deterministic Highway 401 Toronto → Montréal simulation with 3 cars, play/pause/scrub/speed controls, interactive SVG corridor map, chat with sample utterance chips, scenario sliders (weather, traffic, hunger), recommendation cards with per-car detours and trade-offs, lead approve + per-car join/skip, Google Maps handoff, opt-in voice readout, request/response inspector, rejection reasons and event log. Open `/simulate?demo=1` for a scripted auto-run.
-- Deterministic eligibility engine (lead time, GTA exclusion, hard dietary rules, EV charger compatibility, detour caps, group regroup wait, opening hours, stale-position degradation) with a pluggable AI provider (`AI_PROVIDER=mock|mistral`) that only ranks prevalidated candidates; hallucinated IDs are dropped and a deterministic ranker is the fallback.
-- `npm run test` (20 unit tests), `npm run build`, `npm run typecheck` all green. All stop/route data is synthetic and labeled SIMULATION.
+- **Agent 1 — Intent & Conversation** (`POST /api/intent`, `lib/providers/intentAgent.ts`): one LLM call per driver voice transcript or co-passenger message → Zod-validated per-car updates (needs, hunger, urgent restroom, diet, kids, corrections such as "actually no coffee" / "we already ate"). Unknown car ids dropped; regex parser fallback.
+- **Context layer** (`app/api/recommend-stops/route.ts`, `lib/domain/carIntent.ts`, `lib/route/route.ts`, `lib/providers/weather.ts`): one authoritative per-car intent state (persistent diet/kids; temporary needs expire after 120 min or clear at a confirmed stop); car positions/heading on the real route; live Open-Meteo weather at each car now and at each candidate stop at its ETA (cached 30 min per 0.1° cell; failures labelled, simulated fallback).
+- **Agent 2 — Exploration & Decision** (`POST /api/recommend-stops`, `lib/domain/engine.ts`): deterministic hard checks (exit notice, reachability, detour, region, hours, diet, EV), then an **urgency-bounded horizon** — high: nearest suitable exit(s) ≤ 60 km, nearest-first; moderate: next 1–2 usable exits ≤ 120 km; low: up to 220 km for a better stop/weather — widened at most once, plus one bounded second search. One LLM call ranks the validated candidates (or STAY_SILENT, allowed only at low urgency). Notes limited facilities ahead.
+- **Ambient Trip Watcher** (`lib/domain/watcher.ts`, pure): runs every tick in the page; calls Agent 2 only when urgency is high, a suitable exit is approaching with enough notice, a recommendation became unusable (missed/skipped), or urgency/needs changed. Dedupes and rate-limits; quiet while a recommendation is still actionable or a stop is confirmed. Works only while the page is open — no background GPS claims.
+- **Diet:** vegetarian/vegan = veg-friendly preference (Subway-style chains and plazas are fine; steakhouse/bar-style diners excluded, only for meal stops). Halal/gluten-free are strict for meal stops.
+- **Map** (`components/TripMap.tsx`, Leaflet + OpenStreetMap tiles, no key): real 547 km OSRM road geometry, 98 real eastbound 401/A-20 exits (OSM), 1–3 independently moving cars with heading/speed, click-to-place or drag (snaps to the route), recommended stops ranked. **Road ahead** strip (`components/RoadAhead.tsx`): next ~160 km with exits, stops, notice zone, limited-facility gaps and ETA weather.
+- `/simulate` controls: departure time, honest playback rates (1× = real time … 300×), scrub, per-car speed / kids / frozen GPS, add/remove cars, live vs simulated weather, meal history (unknown by default), skip (excludes + re-plans) / approve / per-stop per-car votes, request/response inspector for both agents, event log. `/simulate?demo=1` auto-runs the one-car lunch scenario.
 
 ### Known limitations
-- In-memory demo state (no Supabase sync yet); map is a schematic SVG, not map tiles; voice works only while the page is active; no background GPS claims.
+- Stop businesses, ratings and hours are fictional fixtures (anchored to real exits); no live Places provider yet.
+- In-memory demo state (no Supabase sync); the watcher stops when the tab is suspended.
+- Simulated cars use constant cruise speed; no live traffic. OSM tiles need network (route/exits still draw offline).
+- Meta Muse at medium reasoning effort takes ~15–25 s per decision.

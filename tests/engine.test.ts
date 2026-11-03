@@ -76,11 +76,15 @@ describe("eligibility", () => {
     expect(gta?.reasons.join(" ")).toMatch(/excluded region/);
   });
 
-  it("enforces vegetarian hard rule", () => {
+  it("vegetarian is a veg-friendly preference: plazas/chains allowed, bar-style diners excluded", () => {
     const { eligible, rejected } = evaluateCandidates(stops, makeCars(), hungryIntent, baseConfig, baseTrip, baseEnv);
-    expect(eligible.find((e) => e.stop.id === "hwy_plaza_demo")).toBeUndefined();
-    expect(rejected.find((r) => r.stopId === "hwy_plaza_demo")?.reasons.join(" ")).toMatch(/dietary/);
+    // plaza food court with chain counters (Subway-style) is fine, with a soft note
+    expect(eligible.map((e) => e.stop.id)).toContain("hwy_plaza_demo");
+    expect(rejected.find((r) => r.stopId === "hwy_plaza_demo")?.reasons.join(" ")).toMatch(/options likely/);
     expect(eligible.map((e) => e.stop.id)).toContain("veg_cafe_demo");
+    // veg-focused menu outranks the plaza when otherwise similar
+    const score = (id: string) => eligible.find((e) => e.stop.id === id)!.score;
+    expect(score("veg_cafe_demo")).toBeGreaterThan(score("hwy_plaza_demo"));
   });
 
   it("rejects exits with insufficient lead time", () => {

@@ -6,7 +6,11 @@
       "id": "gta_plaza_demo",
       "name": "GTA Demo Plaza (fictional)",
       "type": "highway-plaza",
-      "categories": ["meal", "coffee", "restroom"],
+      "categories": [
+        "meal",
+        "coffee",
+        "restroom"
+      ],
       "region": "GTA",
       "exitId": "demo-gta",
       "distanceAlongRouteKm": 55,
@@ -19,13 +23,16 @@
       "qualityScoreMock": 0.7,
       "open24h": true,
       "accessMinutes": 2,
-      "reviewCountMock": 412
+      "reviewCountMock": 412,
+      "vegOptions": "some"
     },
     {
       "id": "coffee_early_demo",
       "name": "Early Fuel Coffee Demo (fictional)",
       "type": "coffee",
-      "categories": ["coffee"],
+      "categories": [
+        "coffee"
+      ],
       "region": "GTA",
       "exitId": "demo-gta-2",
       "distanceAlongRouteKm": 80,
@@ -46,7 +53,11 @@
       "id": "hwy_plaza_demo",
       "name": "Highway Plaza Demo (fictional)",
       "type": "highway-plaza",
-      "categories": ["meal", "coffee", "restroom"],
+      "categories": [
+        "meal",
+        "coffee",
+        "restroom"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-1",
       "distanceAlongRouteKm": 190,
@@ -60,13 +71,18 @@
       "open24h": true,
       "accessMinutes": 0,
       "reviewCountMock": 96,
-      "congestionNoteMock": "Queue at plaza is an unverified hypothesis unless measured."
+      "congestionNoteMock": "Queue at plaza is an unverified hypothesis unless measured.",
+      "vegOptions": "some",
+      "vegOptionsNote": "plaza food court with chain counters; veg options likely (fictional)"
     },
     {
       "id": "veg_cafe_demo",
       "name": "Vegetarian Cafe Demo (fictional)",
       "type": "restaurant",
-      "categories": ["meal", "restroom"],
+      "categories": [
+        "meal",
+        "restroom"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-2",
       "distanceAlongRouteKm": 205,
@@ -81,13 +97,19 @@
       "opensLocal": "11:00",
       "closesLocal": "23:00",
       "accessMinutes": 8,
-      "reviewCountMock": 530
+      "reviewCountMock": 530,
+      "vegOptions": "dedicated"
     },
     {
       "id": "ev_bundle_demo",
       "name": "Charge + Bite Hub Demo (fictional)",
       "type": "ev-hub",
-      "categories": ["ev_charge", "meal", "coffee", "restroom"],
+      "categories": [
+        "ev_charge",
+        "meal",
+        "coffee",
+        "restroom"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-3",
       "distanceAlongRouteKm": 232,
@@ -102,15 +124,27 @@
       "accessMinutes": 6,
       "reviewCountMock": 271,
       "chargers": [
-        { "connector": "NACS", "powerKw": 250, "count": 8 },
-        { "connector": "CCS1", "powerKw": 150, "count": 4 }
-      ]
+        {
+          "connector": "NACS",
+          "powerKw": 250,
+          "count": 8
+        },
+        {
+          "connector": "CCS1",
+          "powerKw": 150,
+          "count": 4
+        }
+      ],
+      "vegOptions": "some"
     },
     {
       "id": "chain_demo",
       "name": "Sandwich Chain Demo (fictional)",
       "type": "chain-fallback",
-      "categories": ["meal", "coffee"],
+      "categories": [
+        "meal",
+        "coffee"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-4",
       "distanceAlongRouteKm": 235,
@@ -123,13 +157,17 @@
       "qualityScoreMock": 0.68,
       "open24h": true,
       "accessMinutes": 4,
-      "reviewCountMock": 655
+      "reviewCountMock": 655,
+      "vegOptions": "some",
+      "vegOptionsNote": "sandwich chain \u2014 build-your-own veg options (fictional)"
     },
     {
       "id": "coffee_quick_demo",
       "name": "Quick Coffee Stop Demo (fictional)",
       "type": "coffee",
-      "categories": ["coffee"],
+      "categories": [
+        "coffee"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-5",
       "distanceAlongRouteKm": 245,
@@ -150,7 +188,10 @@
       "id": "coffee_alt_demo",
       "name": "Alternate Roaster Demo (fictional)",
       "type": "coffee",
-      "categories": ["coffee", "restroom"],
+      "categories": [
+        "coffee",
+        "restroom"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-6",
       "distanceAlongRouteKm": 258,
@@ -171,7 +212,10 @@
       "id": "late_diner_demo",
       "name": "Late Diner Demo (fictional)",
       "type": "restaurant",
-      "categories": ["meal", "restroom"],
+      "categories": [
+        "meal",
+        "restroom"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-7",
       "distanceAlongRouteKm": 300,
@@ -186,13 +230,17 @@
       "opensLocal": "10:00",
       "closesLocal": "18:30",
       "accessMinutes": 9,
-      "reviewCountMock": 88
+      "reviewCountMock": 88,
+      "vegOptions": "poor",
+      "vegOptionsNote": "diner/bar-style menu \u2014 few or no vegetarian mains (fictional)"
     },
     {
       "id": "grocery_mart_demo",
       "name": "Corner Grocery Demo (fictional)",
       "type": "grocery",
-      "categories": ["grocery"],
+      "categories": [
+        "grocery"
+      ],
       "region": "Near destination",
       "exitId": "demo-401-8",
       "distanceAlongRouteKm": 385,

@@ -17,6 +17,9 @@ export interface CarState {
   batteryPercent?: number;
   positionUpdatedMinutesAgo: number;
   needs: Need[];
+  lat?: number;
+  lng?: number;
+  headingDeg?: number;
 }
 
 export interface TripContext {
@@ -26,6 +29,8 @@ export interface TripContext {
   elapsedMinutes: number;
   localTime: string;
   minutesSinceLastStop?: number;
+  localDate?: string;
+  lastMealMinutesAgo?: number | null;
 }
 
 export interface CollectiveIntent {
@@ -34,6 +39,8 @@ export interface CollectiveIntent {
   dietary: Dietary[];
   maxDetourMinutes: number;
   kids: boolean;
+  restroomUrgent?: boolean;
+  notHungry?: boolean;
 }
 
 export interface Environment {
@@ -66,11 +73,20 @@ export interface StopCandidate {
   categories: Need[];
   region: string;
   exitId: string;
+  /** Human label of the nearest real exit, e.g. "Exit 543 (Belleville)". */
+  exitLabel?: string;
+  exitKm?: number;
   distanceAlongRouteKm: number;
   lat: number;
   lng: number;
   isMock: true;
   vegetarianVerified: boolean | null;
+  /**
+   * How veg-friendly the menu is (meal stops only). Vegetarian/vegan is a preference, not a filter:
+   * "poor" (steakhouse, bar-style diner) is excluded; "some" (Subway-style chains, plazas) is fine.
+   */
+  vegOptions?: "dedicated" | "good" | "some" | "poor";
+  vegOptionsNote?: string;
   dietaryVerified?: Dietary[];
   restroomsVerified: boolean | null;
   parkingVerified: boolean | null;
@@ -133,6 +149,24 @@ export interface EngineResult {
   provider: string;
   isMock: boolean;
   decidedAtLocal: string;
+  /** Deterministic urgency used to bound exploration. */
+  urgency?: { level: "none" | "low" | "moderate" | "high"; reasons: string[]; needs: Need[]; reminderOnly: boolean };
+  /** Weather at each car now and at each recommended stop at the lead car's ETA. */
+  weather?: { mode: "live" | "simulated"; cars: WeatherSnapshot[]; stops: WeatherSnapshot[] };
+  /** Spoken/short message for solo/driver mode. */
+  speakMessage?: string;
+}
+
+export interface WeatherSnapshot {
+  id: string;
+  condition: Weather;
+  tempC: number | null;
+  precipProbability: number | null;
+  description: string;
+  source: "open-meteo" | "simulated" | "unavailable";
+  forHour: string;
+  stale: boolean;
+  note?: string;
 }
 
 export interface RecommendStopsRequest {
@@ -141,4 +175,5 @@ export interface RecommendStopsRequest {
   cars: CarState[];
   collectiveIntent: CollectiveIntent;
   environment: Environment;
+  options?: { weatherMode: "live" | "simulated"; excludeStopIds: string[] };
 }

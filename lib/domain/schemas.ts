@@ -16,7 +16,10 @@ export const carSchema = z.object({
   connector: z.enum(["NACS", "CCS1"]).optional(),
   batteryPercent: z.number().min(0).max(100).optional(),
   positionUpdatedMinutesAgo: z.number().min(0),
-  needs: z.array(needSchema)
+  needs: z.array(needSchema),
+  lat: z.number().min(-90).max(90).optional(),
+  lng: z.number().min(-180).max(180).optional(),
+  headingDeg: z.number().min(0).max(360).optional()
 });
 
 export const tripContextSchema = z.object({
@@ -25,7 +28,11 @@ export const tripContextSchema = z.object({
   highway: z.string().min(1),
   elapsedMinutes: z.number().min(0),
   localTime: z.string().regex(/^\d{2}:\d{2}$/),
-  minutesSinceLastStop: z.number().min(0).optional()
+  minutesSinceLastStop: z.number().min(0).optional(),
+  /** Local calendar date (America/Toronto) of the simulated/live clock; used for weather lookup. */
+  localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  /** Minutes since last confirmed meal; null/absent = unknown (never assumed). */
+  lastMealMinutesAgo: z.number().min(0).nullable().optional()
 });
 
 export const tripConfigSchema = z.object({
@@ -44,7 +51,9 @@ export const collectiveIntentSchema = z.object({
   hungerLevel: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3)]),
   dietary: z.array(dietarySchema),
   maxDetourMinutes: z.number().min(0),
-  kids: z.boolean()
+  kids: z.boolean(),
+  restroomUrgent: z.boolean().optional(),
+  notHungry: z.boolean().optional()
 });
 
 export const environmentSchema = z.object({
@@ -58,7 +67,14 @@ export const recommendStopsRequestSchema = z.object({
   config: tripConfigSchema,
   cars: z.array(carSchema).min(1).max(3),
   collectiveIntent: collectiveIntentSchema,
-  environment: environmentSchema
+  environment: environmentSchema,
+  options: z
+    .object({
+      weatherMode: z.enum(["live", "simulated"]).default("simulated"),
+      /** Stops the group skipped; excluded until the user reverses it. */
+      excludeStopIds: z.array(z.string()).max(50).default([])
+    })
+    .optional()
 });
 
 export const llmDecisionSchema = z.object({

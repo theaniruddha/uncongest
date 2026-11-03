@@ -7,17 +7,21 @@
     "build": "next build",
     "start": "next start",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "test:watch": "vitest",
     "lint": "next lint",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "leaflet": "^1.9.4",
     "next": "14.2.15",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "zod": "3.23.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/leaflet": "^1.9.12",
     "@types/node": "20.14.0",
     "@types/react": "18.3.3",
     "@types/react-dom": "18.3.0",

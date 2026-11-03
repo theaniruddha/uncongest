@@ -6,7 +6,12 @@
       "id": "bigbox_mart_demo",
       "name": "Big-Box Mart Demo (fictional, Walmart-style)",
       "type": "big-box",
-      "categories": ["meal", "coffee", "restroom", "grocery"],
+      "categories": [
+        "meal",
+        "coffee",
+        "restroom",
+        "grocery"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-9",
       "distanceAlongRouteKm": 268,
@@ -14,7 +19,9 @@
       "lng": -75.85,
       "isMock": true,
       "vegetarianVerified": true,
-      "dietaryVerified": ["vegetarian"],
+      "dietaryVerified": [
+        "vegetarian"
+      ],
       "restroomsVerified": true,
       "parkingVerified": true,
       "qualityScoreMock": 0.45,
@@ -22,13 +29,17 @@
       "opensLocal": "06:00",
       "closesLocal": "23:00",
       "accessMinutes": 3,
-      "reviewCountMock": 1204
+      "reviewCountMock": 1204,
+      "vegOptions": "some"
     },
     {
       "id": "harvest_table_demo",
       "name": "Harvest Table Demo (fictional)",
       "type": "restaurant",
-      "categories": ["meal", "restroom"],
+      "categories": [
+        "meal",
+        "restroom"
+      ],
       "region": "Eastern Ontario",
       "exitId": "demo-401-10",
       "distanceAlongRouteKm": 315,
@@ -36,7 +47,11 @@
       "lng": -75.05,
       "isMock": true,
       "vegetarianVerified": true,
-      "dietaryVerified": ["vegetarian", "halal", "gluten_free"],
+      "dietaryVerified": [
+        "vegetarian",
+        "halal",
+        "gluten_free"
+      ],
       "restroomsVerified": true,
       "parkingVerified": true,
       "qualityScoreMock": 0.91,
@@ -44,13 +59,18 @@
       "opensLocal": "11:00",
       "closesLocal": "22:30",
       "accessMinutes": 11,
-      "reviewCountMock": 342
+      "reviewCountMock": 342,
+      "vegOptions": "good"
     },
     {
       "id": "ev_lounge_demo",
       "name": "Fast-Charge Lounge Demo (fictional)",
       "type": "ev-hub",
-      "categories": ["ev_charge", "coffee", "restroom"],
+      "categories": [
+        "ev_charge",
+        "coffee",
+        "restroom"
+      ],
       "region": "Near destination",
       "exitId": "demo-401-11",
       "distanceAlongRouteKm": 350,
@@ -65,15 +85,26 @@
       "accessMinutes": 5,
       "reviewCountMock": 158,
       "chargers": [
-        { "connector": "NACS", "powerKw": 250, "count": 12 },
-        { "connector": "CCS1", "powerKw": 350, "count": 6 }
+        {
+          "connector": "NACS",
+          "powerKw": 250,
+          "count": 12
+        },
+        {
+          "connector": "CCS1",
+          "powerKw": 350,
+          "count": 6
+        }
       ]
     },
     {
       "id": "lakeside_diner_demo",
       "name": "Lakeside Diner Demo (fictional)",
       "type": "restaurant",
-      "categories": ["meal", "restroom"],
+      "categories": [
+        "meal",
+        "restroom"
+      ],
       "region": "Near destination",
       "exitId": "demo-401-12",
       "distanceAlongRouteKm": 372,
@@ -81,7 +112,9 @@
       "lng": -74.18,
       "isMock": true,
       "vegetarianVerified": true,
-      "dietaryVerified": ["vegetarian"],
+      "dietaryVerified": [
+        "vegetarian"
+      ],
       "restroomsVerified": true,
       "parkingVerified": true,
       "qualityScoreMock": 0.66,
@@ -89,7 +122,8 @@
       "opensLocal": "06:00",
       "closesLocal": "22:00",
       "accessMinutes": 6,
-      "reviewCountMock": 275
+      "reviewCountMock": 275,
+      "vegOptions": "good"
     }
   ]
 }
