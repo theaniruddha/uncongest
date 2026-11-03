@@ -35,7 +35,9 @@ export interface WeatherProvider {
 
 const TTL_MS = 30 * 60 * 1000;
 const TIMEOUT_MS = 6000;
-const TZ = "America/Toronto";
+const DEFAULT_TZ = "America/Toronto";
+/** Open-Meteo serves up to 16 forecast days (+ a little history); beyond that we say so. */
+const FORECAST_DAYS = 16;
 
 interface CellForecast {
   fetchedAtMs: number;
@@ -47,8 +49,8 @@ interface CellForecast {
 
 const cache = new Map<string, CellForecast>();
 
-function cellKey(lat: number, lng: number): string {
-  return `${lat.toFixed(1)},${lng.toFixed(1)}`;
+function cellKey(lat: number, lng: number, tz = DEFAULT_TZ): string {
+  return `${tz}|${lat.toFixed(1)},${lng.toFixed(1)}`;
 }
 
 export function describeWmo(code: number | null): string {
@@ -85,8 +87,8 @@ function hourKey(localDateTime: string): string {
 }
 
 /** Today's date in America/Toronto as YYYY-MM-DD. */
-export function todayLocalDate(now = new Date()): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+export function todayLocalDate(now = new Date(), timeZone = DEFAULT_TZ): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
 }
 
 /** "YYYY-MM-DD" + "HH:mm" + minutes → "YYYY-MM-DDTHH:mm" (calendar-correct, DST ignored). */
@@ -99,7 +101,7 @@ export function addMinutesLocal(localDate: string, localTime: string, minutes: n
 
 export class OpenMeteoWeatherProvider implements WeatherProvider {
   name = "open-meteo";
-  constructor(private fetchImpl: typeof fetch = fetch) {}
+  constructor(private fetchImpl: typeof fetch = fetch, private timeZone: string = DEFAULT_TZ) {}
 
   private async fetchCells(cells: Array<{ key: string; lat: number; lng: number }>): Promise<void> {
     if (cells.length === 0) return;
@@ -107,9 +109,9 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
     url.searchParams.set("latitude", cells.map((c) => c.lat.toFixed(2)).join(","));
     url.searchParams.set("longitude", cells.map((c) => c.lng.toFixed(2)).join(","));
     url.searchParams.set("hourly", "temperature_2m,precipitation_probability,weather_code");
-    url.searchParams.set("past_days", "1");
-    url.searchParams.set("forecast_days", "3");
-    url.searchParams.set("timezone", TZ);
+    url.searchParams.set("past_days", "2");
+    url.searchParams.set("forecast_days", String(FORECAST_DAYS));
+    url.searchParams.set("timezone", this.timeZone);
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
@@ -139,7 +141,7 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
     const now = Date.now();
     const needed = new Map<string, { key: string; lat: number; lng: number }>();
     for (const p of points) {
-      const key = cellKey(p.lat, p.lng);
+      const key = cellKey(p.lat, p.lng, this.timeZone);
       const c = cache.get(key);
       if (!c || now - c.fetchedAtMs > TTL_MS) needed.set(key, { key, lat: Number(p.lat.toFixed(1)), lng: Number(p.lng.toFixed(1)) });
     }
@@ -152,7 +154,7 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
     }
     return points.map((p) => {
       const forHour = hourKey(p.localDateTime);
-      const c = cache.get(cellKey(p.lat, p.lng));
+      const c = cache.get(cellKey(p.lat, p.lng, this.timeZone));
       const idx = c ? c.time.indexOf(forHour) : -1;
       if (!c || idx < 0) {
         return {
@@ -168,7 +170,9 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
           stale: false,
           note: fetchError
             ? `live weather unavailable (${fetchError}); using simulated "${fallback}"`
-            : `no forecast for ${forHour}; using simulated "${fallback}"`
+            : c && c.time.length && forHour > c.time[c.time.length - 1]
+              ? `${forHour.slice(0, 10)} is beyond the ${FORECAST_DAYS}-day forecast range; using simulated "${fallback}"`
+              : `no forecast for ${forHour}; using simulated "${fallback}"`
         };
       }
       const tempC = c.temp[idx] ?? null;
@@ -210,6 +214,6 @@ export class SimulatedWeatherProvider implements WeatherProvider {
   }
 }
 
-export function getWeatherProvider(mode: "live" | "simulated"): WeatherProvider {
-  return mode === "live" ? new OpenMeteoWeatherProvider() : new SimulatedWeatherProvider();
+export function getWeatherProvider(mode: "live" | "simulated", timeZone: string = DEFAULT_TZ): WeatherProvider {
+  return mode === "live" ? new OpenMeteoWeatherProvider(fetch, timeZone) : new SimulatedWeatherProvider();
 }

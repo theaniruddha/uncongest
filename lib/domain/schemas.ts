@@ -68,6 +68,26 @@ export const recommendStopsRequestSchema = z.object({
   cars: z.array(carSchema).min(1).max(3),
   collectiveIntent: collectiveIntentSchema,
   environment: environmentSchema,
+  /** Real-data trip context (/trip). Absent for the legacy 401 demo page. */
+  context: z
+    .object({
+      route: z.object({
+        id: z.string().min(1).max(120),
+        origin: z.object({ label: z.string().max(200), lat: z.number(), lng: z.number(), type: z.enum(["home", "hotel", "other"]).default("other") }),
+        destination: z.object({ label: z.string().max(200), lat: z.number(), lng: z.number(), type: z.enum(["home", "hotel", "other"]).default("other") })
+      }),
+      sessionId: z.string().min(1).max(64).default("anon"),
+      dataMode: z.enum(["real", "demo"]).default("real"),
+      timeZone: z.string().min(1).max(64).default("America/Toronto"),
+      mood: z.array(z.enum(["relaxed", "tired", "hungry", "hurry"])).max(4).default([]),
+      mealPreference: z.enum(["auto", "quick_bite", "proper_meal", "coffee", "custom"]).default("auto"),
+      customMeal: z.string().max(120).optional(),
+      /** Compact relevance-aware context from lib/context/builder.ts (already filtered client-side). */
+      agentContext: z.record(z.unknown()).optional(),
+      /** Opt-in TomTom verification of the top N candidates (still budgeted server-side). */
+      tomtomVerifyTop: z.number().int().min(0).max(3).default(0)
+    })
+    .optional(),
   options: z
     .object({
       weatherMode: z.enum(["live", "simulated"]).default("simulated"),

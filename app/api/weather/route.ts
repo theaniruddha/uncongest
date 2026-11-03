@@ -8,6 +8,7 @@ export const dynamic = "force-dynamic";
 const requestSchema = z.object({
   mode: z.enum(["live", "simulated"]),
   fallback: weatherSchema,
+  timeZone: z.string().min(1).max(64).optional(),
   points: z
     .array(
       z.object({
@@ -33,7 +34,7 @@ export async function POST(req: Request) {
   if (!parsed.success) {
     return NextResponse.json({ error: "schema validation failed", issues: parsed.error.issues }, { status: 422 });
   }
-  const { mode, fallback, points } = parsed.data;
-  const readings = await getWeatherProvider(mode).getReadings(points, fallback);
+  const { mode, fallback, points, timeZone } = parsed.data;
+  const readings = await getWeatherProvider(mode, timeZone).getReadings(points, fallback);
   return NextResponse.json({ mode, readings });
 }

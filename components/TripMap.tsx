@@ -3,12 +3,20 @@
 import { useEffect, useRef, useState } from "react";
 import type * as Leaflet from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { allExits, exitLabel, routeLatLngs, ROUTE } from "@/lib/route/route";
+import { exitLabel, TORONTO_MONTREAL } from "@/lib/route/route";
+import type { RouteModel } from "@/lib/route/model";
 import type { StopCandidate } from "@/lib/domain/types";
 import { CAR_COLORS, type SimCarState } from "@/lib/simulator/simulator";
 
 export interface TripMapProps {
-  cars: SimCarState[];
+  /** Route to draw; defaults to the cached Toronto → Montréal demo route. */
+  route?: RouteModel;
+  /** Draw a dashed detour line from the route to these stops (selected / active). */
+  detourStopIds?: string[];
+  /** Small caption under the map (data provenance). */
+  caption?: string;
+  heightClass?: string;
+  cars: Array<Pick<SimCarState, "id" | "label" | "lat" | "lng" | "headingDeg" | "speedKph" | "positionUpdatedMinutesAgo">>;
   stops: StopCandidate[];
   upcomingExitIds: string[];
   recommendedStopIds: string[];
@@ -21,7 +29,7 @@ export interface TripMapProps {
   onSelectStop: (stopId: string | null) => void;
 }
 
-function carIcon(L: typeof Leaflet, car: SimCarState, stale: boolean): Leaflet.DivIcon {
+function carIcon(L: typeof Leaflet, car: TripMapProps["cars"][number], stale: boolean): Leaflet.DivIcon {
   const color = CAR_COLORS[car.id] ?? "#334155";
   const letter = car.label.replace(/^Car\s*/i, "");
   return L.divIcon({
@@ -61,6 +69,8 @@ export default function TripMap(props: TripMapProps) {
   const carMarkers = useRef(new Map<string, Leaflet.Marker>());
   const stopLayer = useRef<Leaflet.LayerGroup | null>(null);
   const exitLayer = useRef<Leaflet.LayerGroup | null>(null);
+  const routeLayer = useRef<Leaflet.LayerGroup | null>(null);
+  const route = props.route ?? TORONTO_MONTREAL;
   const propsRef = useRef(props);
   propsRef.current = props;
   const [ready, setReady] = useState(false);
@@ -84,8 +94,7 @@ export default function TripMap(props: TripMapProps) {
       });
       tiles.on("tileload", () => setTilesFailed(false));
 
-      const line = L.polyline(routeLatLngs(), { color: "#0f2a43", weight: 5, opacity: 0.75 }).addTo(map);
-      map.fitBounds(line.getBounds(), { padding: [20, 20] });
+      routeLayer.current = L.layerGroup().addTo(map);
       exitLayer.current = L.layerGroup().addTo(map);
       stopLayer.current = L.layerGroup().addTo(map);
 
@@ -105,14 +114,24 @@ export default function TripMap(props: TripMapProps) {
     };
   }, []);
 
-  // ---- exits (all eastbound exits; upcoming reachable ones emphasised) ----
+  // ---- route line (redrawn when the route changes) ----
+  useEffect(() => {
+    const L = LRef.current;
+    const map = mapRef.current;
+    if (!ready || !L || !map || !routeLayer.current) return;
+    routeLayer.current.clearLayers();
+    const line = L.polyline(route.latLngs(), { color: "#0f2a43", weight: 5, opacity: 0.75 }).addTo(routeLayer.current);
+    map.fitBounds(line.getBounds(), { padding: [20, 20] });
+  }, [ready, route]);
+
+  // ---- exits (exits along the route; upcoming reachable ones emphasised) ----
   const upcomingKey = props.upcomingExitIds.join(",");
   useEffect(() => {
     const L = LRef.current;
     if (!ready || !L || !exitLayer.current) return;
     exitLayer.current.clearLayers();
     const upcoming = new Set(props.upcomingExitIds);
-    for (const e of allExits()) {
+    for (const e of route.exits()) {
       const up = upcoming.has(e.id);
       L.circleMarker([e.lat, e.lng], {
         radius: up ? 4.5 : 2.5,
@@ -124,10 +143,10 @@ export default function TripMap(props: TripMapProps) {
         .bindTooltip(`${exitLabel(e)} · km ${e.km.toFixed(0)}${up ? " · upcoming" : ""}`, { direction: "top" })
         .addTo(exitLayer.current);
     }
-  }, [ready, upcomingKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [ready, upcomingKey, route]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- stops ----
-  const stopsKey = `${props.recommendedStopIds.join(",")}|${props.approvedStopId}|${props.excludedStopIds.join(",")}|${props.selectedStopId}`;
+  const stopsKey = `${props.recommendedStopIds.join(",")}|${props.approvedStopId}|${props.excludedStopIds.join(",")}|${props.selectedStopId}|${(props.detourStopIds ?? []).join(",")}`;
   useEffect(() => {
     const L = LRef.current;
     if (!ready || !L || !stopLayer.current) return;
@@ -137,7 +156,7 @@ export default function TripMap(props: TripMapProps) {
       const rank = idx >= 0 ? idx + 1 : null;
       const marker = L.circleMarker([s.lat, s.lng], stopStyle(s, rank, props.approvedStopId === s.id, props.excludedStopIds.includes(s.id), props.selectedStopId === s.id))
         .bindTooltip(
-          `${rank ? `#${rank} ` : ""}${s.name}<br/><span style="color:#64748b">${s.exitLabel ?? s.exitId} · km ${s.distanceAlongRouteKm} · ${s.categories.join(", ")} · SIMULATED business</span>`,
+          `${rank ? `#${rank} ` : ""}${s.name}<br/><span style="color:#64748b">${s.exitLabel ?? s.exitId} · km ${Math.round(s.distanceAlongRouteKm)} · ${s.categories.join(", ")} · ${s.isMock ? "FICTIONAL business (demo)" : `real place · ${s.source === "tomtom" ? "TomTom" : "OpenStreetMap"}${s.provenance === "cached" ? " (cached)" : ""}`}</span>`,
           { direction: "top" }
         )
         .on("click", (ev: Leaflet.LeafletMouseEvent) => {
@@ -145,6 +164,16 @@ export default function TripMap(props: TripMapProps) {
           propsRef.current.onSelectStop(s.id);
         });
       marker.addTo(stopLayer.current);
+      if (props.detourStopIds?.includes(s.id)) {
+        const p = route.pointAtKm(s.distanceAlongRouteKm);
+        L.polyline(
+          [
+            [p.lat, p.lng],
+            [s.lat, s.lng]
+          ],
+          { color: "#0d9488", weight: 3, dashArray: "6 5", interactive: false }
+        ).addTo(stopLayer.current);
+      }
       if (rank) {
         L.marker([s.lat, s.lng], {
           interactive: false,
@@ -157,7 +186,7 @@ export default function TripMap(props: TripMapProps) {
         }).addTo(stopLayer.current);
       }
     }
-  }, [ready, stopsKey, props.stops]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [ready, stopsKey, props.stops, route]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- cars: create / move / remove; draggable, snapping handled by parent ----
   useEffect(() => {
@@ -200,7 +229,7 @@ export default function TripMap(props: TripMapProps) {
 
   return (
     <div className="relative">
-      <div ref={containerRef} className="h-[420px] w-full overflow-hidden rounded-lg border border-slate-200 bg-slate-100 sm:h-[480px]" role="application" aria-label="Trip map" />
+      <div ref={containerRef} className={`${props.heightClass ?? "h-[420px] sm:h-[480px]"} w-full overflow-hidden rounded-lg border border-slate-200 bg-slate-100`} role="application" aria-label="Trip map" />
       {props.placingCarId && (
         <div className="pointer-events-none absolute left-1/2 top-3 z-[1000] -translate-x-1/2 rounded-full bg-navy px-3 py-1 text-xs font-semibold text-white shadow">
           Click on the route to place {props.cars.find((c) => c.id === props.placingCarId)?.label ?? props.placingCarId} — snaps to the nearest point on the highway
@@ -212,8 +241,8 @@ export default function TripMap(props: TripMapProps) {
         </div>
       )}
       <p className="mt-1 text-[11px] text-slate-500">
-        Route: {ROUTE.origin} → {ROUTE.destination}, {ROUTE.totalKm.toFixed(0)} km real road geometry and real eastbound exits ({ROUTE.attribution}, cached).
-        Stop businesses are fictional. Drag a car or use “Place on map”.
+        {props.caption ??
+          `Route: ${route.origin} → ${route.destination}, ${route.totalKm.toFixed(0)} km real road geometry and real exits (${route.attribution}, cached). Stop businesses are fictional. Drag a car or use “Place on map”.`}
       </p>
     </div>
   );

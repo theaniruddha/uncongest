@@ -544,7 +544,8 @@ export function urgencyForRequest(request: import("./types").RecommendStopsReque
       elapsedMinutes: trip.elapsedMinutes,
       localTime: trip.localTime,
       minutesSinceLastStop: trip.minutesSinceLastStop ?? trip.elapsedMinutes,
-      lastMealMinutesAgo: trip.lastMealMinutesAgo ?? null
+      lastMealMinutesAgo: trip.lastMealMinutesAgo ?? null,
+      mood: request.context?.mood
     }
   );
 }

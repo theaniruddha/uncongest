@@ -24,6 +24,8 @@ export interface UrgencyTripInput {
   minutesSinceLastStop: number;
   /** Minutes since the last confirmed meal; null = unknown (never assume "hasn't eaten"). */
   lastMealMinutesAgo: number | null;
+  /** Trip mood from setup: tired → earlier rest break; hungry → meal-time counts more; never "hungry now". */
+  mood?: Array<"relaxed" | "tired" | "hungry" | "hurry">;
 }
 
 export interface UrgencyResult {
@@ -110,6 +112,12 @@ export function evaluateUrgency(input: UrgencyInput, trip: UrgencyTripInput): Ur
     explicit = true;
   }
 
+  const tired = trip.mood?.includes("tired") ?? false;
+  if (tired && trip.minutesSinceLastStop >= 90 && trip.minutesSinceLastStop < 150) {
+    level = raise(level, "moderate");
+    needs.add("restroom");
+    reasons.push(`tired; ${Math.round(trip.minutesSinceLastStop)} min of driving since last rest`);
+  }
   if (trip.minutesSinceLastStop >= 150) {
     level = raise(level, "moderate");
     needs.add("restroom");
@@ -124,9 +132,14 @@ export function evaluateUrgency(input: UrgencyInput, trip: UrgencyTripInput): Ur
   const ateRecently = trip.lastMealMinutesAgo != null && trip.lastMealMinutesAgo < 180;
   if (meal && !ateRecently && !input.notHungry && trip.elapsedMinutes >= 90) {
     const history = trip.lastMealMinutesAgo == null ? "meal history unknown" : `last meal ${trip.lastMealMinutesAgo} min ago`;
-    if (meal.minutesLeft <= 45) {
+    const expectsHunger = trip.mood?.includes("hungry") ?? false;
+    if (meal.minutesLeft <= 45 || expectsHunger) {
       level = raise(level, "moderate");
-      reasons.push(`${meal.name} window closes in ${meal.minutesLeft} min; ${history}`);
+      reasons.push(
+        expectsHunger
+          ? `${meal.name} time and the group expected to be hungry by now; ${history}`
+          : `${meal.name} window closes in ${meal.minutesLeft} min; ${history}`
+      );
     } else {
       level = raise(level, "low");
       reasons.push(`${meal.name} time; ${history} — reminder only`);

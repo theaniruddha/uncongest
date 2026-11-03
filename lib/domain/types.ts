@@ -168,6 +168,8 @@ export interface EngineResult {
   weather?: { mode: "live" | "simulated"; cars: WeatherSnapshot[]; stops: WeatherSnapshot[] };
   /** Spoken/short message for solo/driver mode. */
   speakMessage?: string;
+  toolTrace?: ToolTraceEntry[];
+  usage?: Array<{ provider: string; enabled: boolean; usedInWindow: number; windowLimit: number; usedThisSession: number; sessionLimit: number; cacheHits: number; lastError?: string }>;
 }
 
 export interface WeatherSnapshot {
@@ -189,4 +191,24 @@ export interface RecommendStopsRequest {
   collectiveIntent: CollectiveIntent;
   environment: Environment;
   options?: { weatherMode: "live" | "simulated"; excludeStopIds: string[] };
+  context?: {
+    route: { id: string; origin: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" }; destination: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" } };
+    sessionId: string;
+    dataMode: "real" | "demo";
+    timeZone: string;
+    mood: Array<"relaxed" | "tired" | "hungry" | "hurry">;
+    mealPreference: "auto" | "quick_bite" | "proper_meal" | "coffee" | "custom";
+    customMeal?: string;
+    agentContext?: Record<string, unknown>;
+    tomtomVerifyTop: number;
+  };
+}
+
+/** One auditable step taken while deciding (shown in the inspector). */
+export interface ToolTraceEntry {
+  tool: string;
+  input: string;
+  output: string;
+  provenance?: "live" | "cached" | "fixture" | "simulated" | "unavailable" | "skipped";
+  ms?: number;
 }
