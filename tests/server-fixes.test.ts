@@ -193,9 +193,12 @@ describe("route: tactical labelling + whole-request deadline", () => {
     expect(json.tactical.headline).toBeUndefined();
     expect(json.speakMessage).toBeUndefined();
     expect(json.provider).toMatch(/override/);
+    expect(json.isMock).toBe(true);
+    expect(json.inferenceSource).toBe("Mock");
   });
 
   it("a hung live weather service cannot push the Tactical decision past its budget", async () => {
+    process.env.UNCONGEST_MODE = "full-live";
     vi.stubGlobal("fetch", () => new Promise(() => undefined));
     let seenDeadline = Infinity;
     tacticalStub.impl = async (_ctx, deps) => {
@@ -210,6 +213,8 @@ describe("route: tactical labelling + whole-request deadline", () => {
     // car weather ≤1.5 s + stop weather ≤1.5 s; Muse would get the remaining ~2 s.
     expect(took).toBeLessThan(5000);
     expect(json.weather.cars[0].source).not.toBe("open-meteo");
+    expect(json.isMock).toBe(true);
+    expect(json.inferenceSource).toBe("Mock");
     expect(json.exploration.join(" ")).toMatch(/timed out|unavailable|simulated/);
   }, 10_000);
 });

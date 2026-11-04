@@ -1,3 +1,4 @@
+import { allFixtureStops } from "@/lib/providers/places";
 import type { Need, StopCandidate } from "@/lib/domain/types";
 import { MEAL_WINDOWS } from "@/lib/domain/urgency";
 import { haversineKm, type RouteModel } from "@/lib/route/model";
@@ -51,6 +52,8 @@ export interface CompactPlace {
   vegOptions?: string;
   open24h: boolean;
   offRouteKm?: number;
+  isMock?: boolean;
+  source?: string;
 }
 
 export interface FutureWindow {
@@ -77,7 +80,7 @@ export interface PlacesData {
 }
 
 export interface WeatherData {
-  points: Array<{ id: string; km: number; localTime: string; description: string; tempC: number | null; precipProbability: number | null; source: string; condition: string }>;
+  points: Array<{ id: string; km: number; localTime: string; description: string; tempC: number | null; precipProbability: number | null; source: string; condition: string; recordedAt?: string | null; note?: string }>;
 }
 
 export interface ArrivalData {
@@ -256,6 +259,8 @@ const NEEDS: Need[] = ["meal", "coffee", "restroom", "grocery", "ev_charge"];
 export function compactPlace(c: StopCandidate): CompactPlace {
   return {
     id: c.id,
+    isMock: c.isMock,
+    source: c.isMock ? "fictional demo fixture" : c.source,
     name: c.name,
     km: r1(c.distanceAlongRouteKm),
     categories: c.categories,
@@ -320,7 +325,16 @@ export function findGaps(searched: KmWindow[], places: CompactPlace[], minGapKm 
 async function placesInWindowsTool(ctx: ToolContext): Promise<ToolResult<PlacesData>> {
   const windows = ctx.windows.slice(0, 3);
   if (ctx.input.dataMode === "demo") {
-    return { tool: "placesInWindows", summary: "Demo mode: real-place lookup skipped (fictional fixtures are handled tactically).", provenance: "unavailable", data: { searched: [], perWindow: [], gaps: [], candidates: [] } };
+    const searched = windows.map((w) => ({ minKm: w.fromKm, maxKm: w.toKm }));
+    const places = allFixtureStops()
+      .filter((c) => c.distanceAlongRouteKm > ctx.input.leadKm && windows.some((w) => c.distanceAlongRouteKm >= w.fromKm - 3 && c.distanceAlongRouteKm <= w.toKm + 3))
+      .map(compactPlace);
+    const perWindow = windows.map((w) => ({
+      windowId: w.id, fromKm: w.fromKm, toKm: w.toKm,
+      counts: Object.fromEntries(NEEDS.map((n) => [n, places.filter((p) => p.km >= w.fromKm - 3 && p.km <= w.toKm + 3 && p.categories.includes(n)).length])) as Record<Need, number>,
+      coverage: 1
+    }));
+    return { tool: "placesInWindows", summary: `Mock · ${places.length} fictional demo fixture place(s) in future windows; facilities and hours are authored scenario assumptions.`, provenance: "simulated", data: { searched, perWindow, gaps: [], candidates: places } };
   }
   if (windows.length === 0) {
     return { tool: "placesInWindows", summary: "No future windows to search.", provenance: "simulated", data: { searched: [], perWindow: [], gaps: [], candidates: [] } };
@@ -374,7 +388,7 @@ async function weatherAtWaypointsTool(ctx: ToolContext): Promise<ToolResult<Weat
   const mode = ctx.input.dataMode === "demo" ? "simulated" : "live";
   const readings = await getWeatherProvider(mode, ctx.input.timeZone).getReadings(
     pts.map(({ id, lat, lng, localDateTime }) => ({ id, lat, lng, localDateTime })),
-    "cloudy"
+    ctx.input.weatherCondition ?? "cloudy"
   );
   const points = readings.map((r, i) => ({
     id: r.id,
@@ -384,16 +398,19 @@ async function weatherAtWaypointsTool(ctx: ToolContext): Promise<ToolResult<Weat
     tempC: r.tempC,
     precipProbability: r.precipProbability,
     source: r.source,
-    condition: r.condition
+    condition: r.condition,
+    recordedAt: r.fetchedAt,
+    note: r.note
   }));
   const live = points.filter((p) => p.source === "open-meteo");
-  const provenance: EvidenceProvenance = live.length ? "live" : mode === "simulated" ? "simulated" : "unavailable";
+  const simulated = points.filter((p) => p.source === "simulated");
+  const provenance: EvidenceProvenance = live.length ? "live" : simulated.length ? "simulated" : "unavailable";
   const summary = live.length
     ? live
         .map((p) => `${p.id === "destination" ? "destination" : `km ${p.km}`} ${p.localTime}: ${p.description}${p.tempC != null ? ` ${Math.round(p.tempC)}°C` : ""}${p.precipProbability != null ? ` ${p.precipProbability}% precip` : ""}`)
         .join("; ")
-    : "Forecast unavailable along the remaining route (no live readings).";
-  return { tool: "weatherAtWaypoints", summary: clip(summary), provenance, data: { points: live.length ? live : [] } };
+    : simulated.length ? `Mock weather snapshot: ${simulated[0].description}; ${simulated[0].note ?? "simulated scenario, not a live forecast"}` : "Forecast unavailable along the remaining route (no live readings).";
+  return { tool: "weatherAtWaypoints", summary: clip(summary), provenance, data: { points: live.length ? live : simulated } };
 }
 
 /* ------------------------------------------------------------------ arrival */

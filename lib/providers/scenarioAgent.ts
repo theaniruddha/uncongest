@@ -1,3 +1,4 @@
+import { safeLlmError } from "@/lib/agent2/llmSafety";
 import { z } from "zod";
 import { dietarySchema, needSchema } from "@/lib/domain/schemas";
 import { mealHistorySchema, mealPreferenceSchema, moodSchema, tripSetupSchema, type TripSetup } from "@/lib/trip/types";
@@ -402,7 +403,7 @@ export async function interpretScenario(input: ScenarioRequest): Promise<Scenari
       isMock: false
     });
   } catch (err) {
-    const reason = (err as Error).message;
+    const reason = safeLlmError(err);
     console.warn(`[ai:scenario] ${client.name} failed (${reason}); keyword fallback used`);
     return finalize({ ...fallbackScenario(req), provider: `${client.name} failed; keyword fallback`, isMock: true, fallbackReason: reason.slice(0, 300) });
   }

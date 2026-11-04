@@ -77,7 +77,8 @@ export const strategicInputSchema = z.object({
   kids: z.boolean().default(false),
   lastMealMinutesAgo: z.number().min(0).nullable().default(null),
   drivingMinutesSinceRest: z.number().min(0).default(0),
-  dataMode: z.enum(["real", "demo"]).default("real")
+  dataMode: z.enum(["real", "demo"]).default("real"),
+  weatherCondition: z.enum(["sunny", "cloudy", "rain", "snow", "cold"]).optional()
 });
 export type StrategicInput = z.infer<typeof strategicInputSchema>;
 export type StrategicInputRaw = z.input<typeof strategicInputSchema>;

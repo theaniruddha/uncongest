@@ -17,7 +17,7 @@ export default function Landing() {
           href="/trip"
           className="focus-ring rounded-lg bg-teal px-6 py-3 font-semibold text-white shadow hover:bg-teal/90"
         >
-          Plan & simulate your own trip
+          Try the one-car trip demo
         </Link>
         <Link
           href="/simulate"
@@ -43,7 +43,7 @@ export default function Landing() {
         </li>
         <li className="rounded-lg border border-slate-200 bg-white p-4">
           <strong className="block text-navy">Honest mock data</strong>
-          All stops, ratings and routes in this demo are synthetic and clearly labeled SIMULATION.
+          Recorded OSM road geometry, fictional demo businesses and dated mock weather carry visible source labels.
         </li>
       </ul>
     </main>

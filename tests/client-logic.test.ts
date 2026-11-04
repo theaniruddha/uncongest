@@ -31,6 +31,8 @@ const stop = (status: string, satisfiedNeeds: string[] = []) => ({ stopId: "s1",
 describe("context versions: setup-level fields", () => {
   const cases: Array<[string, (v: VersionInput) => void]> = [
     ["departure time", (v) => (v.setup.departureUtcIso = "2026-11-03T22:00:00.000Z")],
+    ["max detour", (v) => (v.setup.maxDetourMinutes = 4)],
+    ["kids", (v) => (v.intents.car_a!.kids = true)],
     ["departure mode", (v) => (v.setup.departureMode = "arrive_by")],
     ["mood", (v) => (v.setup.mood = ["hurry"])],
     ["meal preference", (v) => (v.setup.mealPreference = "coffee")],

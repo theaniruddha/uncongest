@@ -1,0 +1,12 @@
+{
+  "authoredAt": "2026-11-04T12:00:00Z",
+  "source": "Uncongest authored mock scenario, not observed weather or an Open-Meteo recording",
+  "license": "CC0-1.0",
+  "conditions": {
+    "sunny": { "tempC": 16, "precipProbability": 5, "weatherCode": 0 },
+    "cloudy": { "tempC": 12, "precipProbability": 20, "weatherCode": 3 },
+    "cold": { "tempC": 1, "precipProbability": 10, "weatherCode": 2 },
+    "rain": { "tempC": 8, "precipProbability": 85, "weatherCode": 61 },
+    "snow": { "tempC": -2, "precipProbability": 85, "weatherCode": 71 }
+  }
+}

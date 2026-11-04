@@ -1,3 +1,4 @@
+import { safeLlmError } from "@/lib/agent2/llmSafety";
 import { NextResponse } from "next/server";
 import { recommendStopsRequestSchema } from "@/lib/domain/schemas";
 import { decideWithExploration, urgencyForRequest } from "@/lib/domain/engine";
@@ -58,7 +59,7 @@ export async function POST(req: Request) {
       trace.push({ tool, input, output: summarize(r), provenance, ms: Date.now() - t0 });
       return r;
     } catch (err) {
-      trace.push({ tool, input, output: `failed: ${(err as Error).message}`, provenance: "unavailable", ms: Date.now() - t0 });
+      trace.push({ tool, input, output: `failed: ${safeLlmError(err)}`, provenance: "unavailable", ms: Date.now() - t0 });
       throw err;
     }
   };
@@ -171,7 +172,8 @@ export async function POST(req: Request) {
       }
     };
   }
-  const providerNote = { value: provider.name };
+  const providerNote = { value: provider.isMock ? "Mock · deterministic" : "Mock · deterministic (no model decision needed)" };
+  let usedLiveDecision = false;
   let stopWeather: Record<string, WeatherSnapshot> = {};
   let eligibleSeen: EligibleStop[] = [];
   let tacticalMeta: TacticalMeta | null = null;
@@ -205,6 +207,7 @@ export async function POST(req: Request) {
         preferences: tripCtx ? { mood: tripCtx.mood, mealPreference: tripCtx.mealPreference, customMeal: tripCtx.customMeal } : undefined,
         strategicHints: tripCtx?.strategicHints ?? []
       }, { deadlineMs: Math.max(MIN_MUSE_MS, remaining()) });
+      usedLiveDecision = t.meta.status === "muse";
       tacticalMeta = t.meta;
       tacticalDecision = t.decision;
       trace.push({
@@ -235,6 +238,8 @@ export async function POST(req: Request) {
         tripContext: tripCtx?.agentContext,
         preferences: tripCtx ? { mood: tripCtx.mood, mealPreference: tripCtx.mealPreference, customMeal: tripCtx.customMeal } : undefined
       });
+      usedLiveDecision = !provider.isMock;
+      providerNote.value = provider.isMock ? "Mock · deterministic" : provider.name;
       trace.push({
         tool: `agent2.${provider.isMock ? "mock" : "llm"}`,
         input: `${ctx.eligible.length} validated candidate(s), urgency ${ctx.urgency.level}`,
@@ -244,8 +249,8 @@ export async function POST(req: Request) {
       });
       return decision;
     } catch (err) {
-      trace.push({ tool: "agent2.llm", input: provider.name, output: `failed: ${(err as Error).message}`, provenance: "unavailable", ms: Date.now() - t0 });
-      providerNote.value = `${provider.name} failed (${(err as Error).message}); deterministic fallback used`;
+      trace.push({ tool: "agent2.llm", input: provider.name, output: `failed: ${safeLlmError(err)}`, provenance: "unavailable", ms: Date.now() - t0 });
+      providerNote.value = `${provider.name} failed (${safeLlmError(err)}); deterministic fallback used`;
       console.warn(`[ai:decision] ${providerNote.value}`);
       return null;
     }
@@ -265,6 +270,8 @@ export async function POST(req: Request) {
   return NextResponse.json({
     ...result,
     provider: providerNote.value,
+    isMock: !usedLiveDecision || museOverridden,
+    inferenceSource: usedLiveDecision && !museOverridden ? "Live" : "Mock",
     // A Muse headline the engine did not act on was never validated → never speak it.
     speakMessage: museOverridden ? undefined : result.speakMessage,
     exploration: [...contextNotes, ...result.exploration],

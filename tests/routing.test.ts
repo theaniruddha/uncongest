@@ -90,6 +90,7 @@ function mockFetch(handlers: { osrm?: () => Response; overpass?: () => Response;
 
 let tmpRoot = "";
 beforeEach(() => {
+  vi.stubEnv("UNCONGEST_MODE", "full-live");
   tmpRoot = mkdtempSync(path.join(os.tmpdir(), "uncongest-routing-"));
   process.env.UNCONGEST_CACHE_DIR = path.join(tmpRoot, "cache");
   process.env.UNCONGEST_RECORDED_DIR = path.join(tmpRoot, "recorded");
@@ -100,6 +101,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
   delete process.env.UNCONGEST_CACHE_DIR;
   delete process.env.UNCONGEST_RECORDED_DIR;

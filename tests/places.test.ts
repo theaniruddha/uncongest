@@ -62,6 +62,7 @@ function restoreEnv() {
 }
 
 beforeEach(() => {
+  vi.stubEnv("UNCONGEST_MODE", "full-live");
   delete process.env.TOMTOM_LIVE;
   delete process.env.TOMTOM_API_KEY;
   delete process.env.OVERPASS_LIVE;
@@ -70,6 +71,7 @@ beforeEach(() => {
   resetBudgets();
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   restoreEnv();
   resetBudgets();
 });

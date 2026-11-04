@@ -1,3 +1,6 @@
+import snapshot from "@/data/weather/demo.snapshot.json";
+import { externalProvidersEnabled } from "@/lib/runtimeMode";
+import { getBudget } from "./budget";
 import type { Weather } from "@/lib/domain/types";
 
 /**
@@ -48,6 +51,8 @@ interface CellForecast {
 }
 
 const cache = new Map<string, CellForecast>();
+/** Coalesce overlapping requests from Tactical, Strategic and the road-ahead view. */
+const inflightCells = new Map<string, Promise<void>>();
 
 function cellKey(lat: number, lng: number, tz = DEFAULT_TZ): string {
   return `${tz}|${lat.toFixed(1)},${lng.toFixed(1)}`;
@@ -105,6 +110,9 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
 
   private async fetchCells(cells: Array<{ key: string; lat: number; lng: number }>): Promise<void> {
     if (cells.length === 0) return;
+    const budget = getBudget("open-meteo");
+    const refused = budget.take();
+    if (refused) throw new Error(refused);
     const url = new URL("https://api.open-meteo.com/v1/forecast");
     url.searchParams.set("latitude", cells.map((c) => c.lat.toFixed(2)).join(","));
     url.searchParams.set("longitude", cells.map((c) => c.lng.toFixed(2)).join(","));
@@ -147,7 +155,17 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
     }
     let fetchError: string | null = null;
     try {
-      await this.fetchCells([...needed.values()]);
+      const fresh = [...needed.values()].filter((cell) => !inflightCells.has(cell.key));
+      if (fresh.length) {
+        const pending = this.fetchCells(fresh);
+        for (const cell of fresh) inflightCells.set(cell.key, pending);
+        const clear = () => {
+          for (const cell of fresh) if (inflightCells.get(cell.key) === pending) inflightCells.delete(cell.key);
+        };
+        // Both handlers consume settlement without creating an unhandled rejection.
+        void pending.then(clear, clear);
+      }
+      await Promise.all([...new Set([...needed.keys()].map((key) => inflightCells.get(key)).filter((p): p is Promise<void> => !!p))]);
     } catch (err) {
       fetchError = (err as Error).message;
       console.warn(`[weather] ${fetchError}; using cached/simulated fallback`);
@@ -215,5 +233,23 @@ export class SimulatedWeatherProvider implements WeatherProvider {
 }
 
 export function getWeatherProvider(mode: "live" | "simulated", timeZone: string = DEFAULT_TZ): WeatherProvider {
+  if (!externalProvidersEnabled()) return new SnapshotWeatherProvider();
   return mode === "live" ? new OpenMeteoWeatherProvider(fetch, timeZone) : new SimulatedWeatherProvider();
+}
+
+/** Authored, dated weather scenario; never presented as observed or live weather. */
+export class SnapshotWeatherProvider implements WeatherProvider {
+  name = "mock-weather-snapshot";
+  async getReadings(points: WeatherPointRequest[], fallback: Weather): Promise<WeatherReading[]> {
+    return points.map((p) => {
+      const values = snapshot.conditions[fallback];
+      return {
+        id: p.id, condition: fallback, tempC: values.tempC,
+        precipProbability: values.precipProbability, weatherCode: values.weatherCode,
+        description: `Mock snapshot: ${fallback}`, source: "simulated",
+        forHour: hourKey(p.localDateTime), fetchedAt: snapshot.authoredAt, stale: true,
+        note: `Authored mock weather snapshot ${snapshot.authoredAt.slice(0, 10)}; replayed for scenario time, not a forecast. No weather service called.`
+      };
+    });
+  }
 }

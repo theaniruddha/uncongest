@@ -13,9 +13,9 @@ import { summarize, versionHash, type WorkflowSample } from "@/lib/agent2/metric
 import { checkTacticalStaleness, withoutSkipped } from "@/lib/agent2/staleness";
 import { strategicContextVersion, tacticalContextVersion, type VersionInput } from "@/lib/agent2/versions";
 import RoadAhead, { type RoadAheadWaypoint } from "../RoadAhead";
-import { createRouteModel, type RouteModel } from "@/lib/route/model";
+import { createRouteModel, haversineKm, type RouteModel } from "@/lib/route/model";
 import type { TripRoute, TripSetup, StopPlan } from "@/lib/trip/types";
-import { NAMED_PLACES, SCENARIO_PRESETS, getScenarioPreset } from "@/lib/trip/presets";
+import { MONTREAL, TORONTO, NAMED_PLACES, SCENARIO_PRESETS, getScenarioPreset } from "@/lib/trip/presets";
 import { buildTimeline, carStateOnRoute, placeFollower, placeLead, type TripCar } from "@/lib/trip/sim";
 import { arrivalDaylight, defaultDwellMinutes, destinationEta, etaImpactOfStop } from "@/lib/trip/eta";
 import { localDateTimeToUtc, sunTimes, utcToLocal, formatInZone } from "@/lib/trip/daylight";
@@ -71,7 +71,7 @@ interface LogEntry {
 }
 
 function defaultSetup(today: string): TripSetup {
-  const base = getScenarioPreset("early-lunch-overdue")!.setup(today);
+  const base = getScenarioPreset("toronto-montreal-demo")!.setup(today);
   return { ...base, departure: { ...base.departure, time: "09:30" }, mood: ["hungry", "relaxed"], mealPreference: "auto" };
 }
 
@@ -257,6 +257,7 @@ export default function TripPlanner() {
               departureMode: plan.setup.departure.mode,
               tz: plan.tz,
               dataMode: plan.setup.dataMode,
+              maxDetourMinutes: plan.setup.maxDetourMinutes,
               mood: plan.setup.mood,
               mealPreference: plan.setup.mealPreference,
               mealHistory: plan.setup.mealHistory,
@@ -276,6 +277,12 @@ export default function TripPlanner() {
   const strategicVersion = useMemo(() => (versionInput ? strategicContextVersion({ ...versionInput, epoch: strategicEpoch }) : null), [versionInput, strategicEpoch]);
   const contextVersionRef = useRef(contextVersion);
   contextVersionRef.current = contextVersion;
+  // A displayed recommendation belongs to the context that produced it, too.
+  useEffect(() => {
+    setResult(null);
+    memoryRef.current = EMPTY_MEMORY;
+    setMemory(EMPTY_MEMORY);
+  }, [contextVersion]);
   const elapsedRef = useRef(elapsed);
   elapsedRef.current = elapsed;
   const skippedRef = useRef(skipped);
@@ -355,7 +362,12 @@ export default function TripPlanner() {
 
   /** Plan (or re-plan) a route. `via` forces an alternative; `keepIntents` preserves passenger needs on a mid-trip switch. */
   const planRoute = async (opts: { via?: Array<{ lat: number; lng: number }>; setupOverride?: TripSetup; keepIntents?: Record<string, CarIntent>; note?: string } = {}) => {
-    const setup = opts.setupOverride ?? setupState;
+    const requestedSetup = opts.setupOverride ?? setupState;
+    // Fictional 401 stops must never appear on a manually changed corridor.
+    const fixtureCorridor = !opts.via?.length &&
+      haversineKm([requestedSetup.origin.lng, requestedSetup.origin.lat], [TORONTO.lng, TORONTO.lat]) < 3 &&
+      haversineKm([requestedSetup.destination.lng, requestedSetup.destination.lat], [MONTREAL.lng, MONTREAL.lat]) < 3;
+    const setup: TripSetup = requestedSetup.dataMode === "demo" && !fixtureCorridor ? { ...requestedSetup, dataMode: "real" } : requestedSetup;
     const clickAt = performance.now();
     const seq = ++routeGenRef.current;
     setPlanning(true);
@@ -601,7 +613,8 @@ export default function TripPlanner() {
       mealPreference: plan.setup.mealPreference,
       mealHistory: plan.setup.mealHistory,
       dietary: groupDiet,
-      kids: plan.setup.cars.some((c) => c.kids > 0),
+      kids: plan.setup.cars.some((c) => c.kids > 0 || intents[c.id]?.kids),
+      weatherCondition: weatherOverride === "live" ? "sunny" : weatherOverride,
       lastMealMinutesAgo: lastMealMinutesAgo == null ? null : Math.round(lastMealMinutesAgo),
       drivingMinutesSinceRest: Math.round(lead.drivingMinutesSinceRest),
       dataMode: plan.setup.dataMode
@@ -609,7 +622,7 @@ export default function TripPlanner() {
   }, [plan, lead, routeVersion, strategicVersion, intents, sessionId, tz, elapsed, leadCar, nowLocal.time, groupDiet, lastMealMinutesAgo, weatherOverride]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const strategic = useStrategic({
-    enabled: Boolean(plan) && plan?.setup.dataMode !== "demo",
+    enabled: Boolean(plan),
     routeVersion,
     contextVersion: strategicVersion,
     buildInput: buildStrategicInput,
@@ -755,7 +768,7 @@ export default function TripPlanner() {
           progressKm: Math.round(st.progressKm * 10) / 10,
           speedKph: c.speedKph,
           passengers: c.adults + c.kids,
-          kids: c.kids > 0,
+          kids: c.kids > 0 || Boolean(intents[c.id]?.kids),
           ev: false,
           positionUpdatedMinutesAgo: st.positionUpdatedMinutesAgo,
           needs: (intents[c.id]?.needs ?? []).map((n) => n.need),
@@ -863,7 +876,7 @@ export default function TripPlanner() {
         const status = tac?.status === "muse" ? "muse" : tac?.status === "timeout" ? "timeout" : tac ? "fallback" : "fallback";
         setTacticalSamples((x) => [...x.slice(-100), { ms: tac?.totalMs ?? clientMs, status, at: Date.now() }]);
         setTacticalState({ status, ms: clientMs, headline: tac?.headline, decision: tac?.decision, detail: tac?.detail });
-        if (tac?.decision === "SEARCH_FARTHER" && plan && model && lead) {
+        if (tac?.decision === "SEARCH_FARTHER" && plan && model && lead && plan.setup.dataMode !== "demo") {
           const known = knownPlaces.some((k) => k.distanceAlongRouteKm > lead.progressKm);
           const from = lead.progressKm + (known ? 60 : (leadCar.speedKph * NOTICE_MIN) / 60);
           void discover(plan.route, [{ minKm: from, maxKm: Math.min(model.totalKm, from + 60), reason: "Tactical asked to search farther" }], plan.setup, model);
@@ -945,7 +958,7 @@ export default function TripPlanner() {
       .filter((km, i, a) => a.indexOf(km) === i)
       .map((km, i) => ({ id: `wp${i}`, km, etaMinutes: ((km - lead.progressKm) / leadCar.speedKph) * 60 }));
   }, [lead, leadCar, model]);
-  const weatherKey = `${plan?.route.id}|${Math.floor((lead?.progressKm ?? 0) / 20)}|${nowLocal.time.slice(0, 2)}|${eta?.arrivalLocal}`;
+  const weatherKey = `${plan?.route.id}|${weatherOverride}|${Math.floor((lead?.progressKm ?? 0) / 20)}|${nowLocal.time.slice(0, 2)}|${eta?.arrivalLocal}`;
   useEffect(() => {
     if (!plan || !model || !eta) return;
     const ctrl = new AbortController();
@@ -960,7 +973,7 @@ export default function TripPlanner() {
         return { id: "dest", lat: plan.setup.destination.lat, lng: plan.setup.destination.lng, localDateTime: `${t.date}T${t.time}` };
       })()
     ];
-    fetch("/api/weather", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "live", fallback: "sunny", timeZone: tz, points: pts }), signal: ctrl.signal })
+    fetch("/api/weather", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: weatherOverride === "live" ? "live" : "simulated", fallback: weatherOverride === "live" ? "sunny" : weatherOverride, timeZone: tz, points: pts }), signal: ctrl.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((d: { readings: WeatherSnapshot[] }) => setWaypointWeather(Object.fromEntries(d.readings.map((r) => [r.id, r]))))
       .catch(() => undefined);
@@ -1053,6 +1066,9 @@ export default function TripPlanner() {
   const sendMessage = async (override?: string) => {
     const t = (override ?? chatText).trim();
     if (!t || chatBusy || !plan) return;
+    const generation = tripGenRef.current;
+    const version = contextVersionRef.current;
+    const speaker = chatCar;
     setChatBusy(true);
     const body = {
       carId: chatCar,
@@ -1067,7 +1083,7 @@ export default function TripPlanner() {
         })
       )
     };
-    let out: IntentAgentOutput & { provider: string };
+    let out: IntentAgentOutput & { provider: string; isMock?: boolean };
     try {
       const res = await fetch("/api/intent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const data = await res.json().catch(() => null);
@@ -1076,13 +1092,19 @@ export default function TripPlanner() {
     } catch (e) {
       out = { ...regexIntentUpdate(chatCar, t), provider: `client fallback (${(e as Error).message})` };
     }
+    if (generation !== tripGenRef.current || version !== contextVersionRef.current) {
+      pushLog("info", "Agent 1 response discarded because the trip context changed; send the message again.");
+      setChatBusy(false);
+      return;
+    }
     setIntents((prev) => {
       const next = { ...prev };
-      for (const u of out.updates) next[u.carId] = applyIntentUpdate(next[u.carId] ?? emptyCarIntent(u.carId), u, elapsed, u.carId === chatCar ? t : undefined);
+      for (const u of out.updates) if (next[u.carId]) next[u.carId] = applyIntentUpdate(next[u.carId], u, elapsedRef.current, u.carId === speaker ? t : undefined);
       return next;
     });
-    setAgent1((a) => [...a.slice(-20), { time: nowLocal.time, carId: chatCar, source: chatSource, text: t, provider: out.provider, understood: out.understood }]);
-    pushLog("agent1", `Agent 1 (${out.provider}) ${chatCar}: “${t}” → ${out.understood.join("; ") || "no change"}`);
+    const providerLabel = `${out.isMock === false ? "Live" : "Mock"} · ${out.provider}`;
+    setAgent1((a) => [...a.slice(-20), { time: nowLocal.time, carId: speaker, source: chatSource, text: t, provider: providerLabel, understood: out.understood }]);
+    pushLog("agent1", `Agent 1 (${providerLabel}) ${speaker}: “${t}” → ${out.understood.join("; ") || "no change"}`);
     setChatText("");
     setChatBusy(false);
   };
@@ -1286,8 +1308,8 @@ export default function TripPlanner() {
             {!plan
               ? "Set up a trip on the left, then plan the route."
               : demo
-                ? "DEMO MODE · real 401 route & exits · FICTIONAL businesses · driving is simulated"
-                : `Real route (${plan.route.source === "fixture" ? "cached OSRM" : plan.route.source === "cache" ? "OSRM, cached" : "OSRM"}) · real places (OpenStreetMap${discovering ? ", discovering…" : ""}) · Open-Meteo forecasts for ${plan.setup.departure.date} · driving is simulated`}
+                ? "FIXTURE EVIDENCE · recorded 401 route & exits · FICTIONAL businesses · dated mock weather · simulated driving"
+                : `Route (${plan.route.source}) · OpenStreetMap places${discovering ? " (discovering…)" : ""} · weather source shown at each waypoint · simulated driving`}
           </p>
         </div>
 
@@ -1387,14 +1409,14 @@ export default function TripPlanner() {
             {tacticalState.status === "idle"
               ? "waiting for a reason to decide"
               : tacticalState.status === "running"
-                ? "deciding now (≤ 5 s budget)…"
+                ? "deciding now…"
                 : tacticalState.status === "muse"
-                  ? `Muse decision${tacticalState.decision ? ` ${tacticalState.decision}` : ""} in ${((tacticalState.ms ?? 0) / 1000).toFixed(1)} s`
+                  ? `Live Muse decision${tacticalState.decision ? ` ${tacticalState.decision}` : ""} in ${((tacticalState.ms ?? 0) / 1000).toFixed(1)} s`
                   : tacticalState.status === "stale"
                     ? `last result discarded as stale (${tacticalState.detail})`
                     : tacticalState.status === "error"
                       ? `error: ${tacticalState.detail}`
-                      : `deterministic ranking (${tacticalState.status}${tacticalState.detail ? `: ${tacticalState.detail.slice(0, 80)}` : ""}) in ${((tacticalState.ms ?? 0) / 1000).toFixed(1)} s`}
+                      : `Recorded/Mock · deterministic ranking (${tacticalState.status}${tacticalState.detail ? `: ${tacticalState.detail.slice(0, 80)}` : ""}) in ${((tacticalState.ms ?? 0) / 1000).toFixed(1)} s`}
           </p>
           {tacticalState.headline && tacticalState.status === "muse" && <p className="mt-0.5 text-xs font-medium text-navy">“{tacticalState.headline}”</p>}
           {plan && (
@@ -1483,7 +1505,7 @@ export default function TripPlanner() {
           </div>
           {loading && (
             <p className="mt-1 text-xs text-slate-500">
-              Agent 2 is checking real places at the exits ahead and the forecast at arrival…{heldForDecision ? " (simulated time paused meanwhile)" : ""}
+              Agent 2 is checking available places and weather evidence at arrival…{heldForDecision ? " (simulated time paused meanwhile)" : ""}
             </p>
           )}
           {error && (
@@ -1535,7 +1557,7 @@ export default function TripPlanner() {
           </div>
         </section>
 
-        {plan && plan.setup.dataMode !== "demo" && (
+        {plan && (
           <StrategicPanel
             state={strategic.state}
             isCurrent={strategic.isCurrent}

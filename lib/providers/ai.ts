@@ -1,3 +1,5 @@
+import { getRuntimeMode } from "@/lib/runtimeMode";
+import { museApiKey, safeLlmError, takeLlmRateSlot } from "@/lib/agent2/llmSafety";
 import { llmDecisionSchema, type LlmDecision } from "@/lib/domain/schemas";
 import type {
   CarState,
@@ -41,17 +43,6 @@ export function extractJson(content: string): unknown {
   }
 }
 
-/** Rolling 10-minute cap on LLM calls for the whole server process (cost guard). */
-const callLog: number[] = [];
-function takeRateSlot(): boolean {
-  const limit = Number(process.env.LLM_MAX_CALLS_PER_10_MIN ?? 30);
-  const now = Date.now();
-  while (callLog.length && now - callLog[0] > 10 * 60_000) callLog.shift();
-  if (callLog.length >= limit) return false;
-  callLog.push(now);
-  return true;
-}
-
 interface MetaClientConfig {
   baseUrl: string;
   apiKey: string;
@@ -74,7 +65,7 @@ export class MetaResponsesClient implements LlmClient {
     this.name = `meta:${cfg.model}`;
   }
   async complete(system: string, user: string): Promise<LlmCallResult> {
-    if (!takeRateSlot()) throw new Error("LLM rate limit reached (LLM_MAX_CALLS_PER_10_MIN)");
+    if (!takeLlmRateSlot()) throw new Error("LLM rate limit reached (LLM_MAX_CALLS_PER_10_MIN)");
     const payload = {
       model: this.cfg.model,
       input: [
@@ -102,8 +93,8 @@ export class MetaResponsesClient implements LlmClient {
         signal: controller.signal
       });
       if (!res.ok || !res.body) {
-        const detail = (await res.text().catch(() => "")).slice(0, 300);
-        throw new Error(`meta http ${res.status}${detail ? `: ${detail}` : ""}`);
+        await res.body?.cancel();
+        throw new Error(`meta http ${res.status}`);
       }
       const { text, usage, status } = await readResponsesStream(res.body);
       const ms = Date.now() - started;
@@ -112,7 +103,7 @@ export class MetaResponsesClient implements LlmClient {
       return { text, usage, ms };
     } catch (err) {
       if ((err as Error).name === "AbortError") throw new Error(`meta timeout after ${this.cfg.timeoutMs} ms`);
-      throw err;
+      throw new Error(safeLlmError(err));
     } finally {
       clearTimeout(timeout);
     }
@@ -139,7 +130,7 @@ async function readResponsesStream(body: ReadableStream<Uint8Array>): Promise<{ 
     if (type === "response.output_text.delta" && typeof evt.delta === "string") {
       deltas += evt.delta;
     } else if (type === "error" || type === "response.failed") {
-      throw new Error(`meta stream error: ${JSON.stringify(evt.error ?? evt.response?.error ?? evt).slice(0, 300)}`);
+      throw new Error("meta stream error");
     } else if (type === "response.completed" || type === "response.incomplete") {
       const r = evt.response ?? {};
       status = r.status ?? type;
@@ -171,7 +162,7 @@ async function readResponsesStream(body: ReadableStream<Uint8Array>): Promise<{ 
 export class ChatCompletionsClient implements LlmClient {
   constructor(public name: string, private baseUrl: string, private apiKey: string, private model: string, private timeoutMs: number, private agent: AgentName) {}
   async complete(system: string, user: string): Promise<LlmCallResult> {
-    if (!takeRateSlot()) throw new Error("LLM rate limit reached (LLM_MAX_CALLS_PER_10_MIN)");
+    if (!takeLlmRateSlot()) throw new Error("LLM rate limit reached (LLM_MAX_CALLS_PER_10_MIN)");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     const started = Date.now();
@@ -207,9 +198,10 @@ function num(v: string | undefined, d: number): number {
 
 /** Returns a live client for the given agent, or null in mock mode / without a key. */
 export function getLlmClient(agent: AgentName): LlmClient | null {
-  const provider = (process.env.AI_PROVIDER ?? "mock").toLowerCase();
+  if (getRuntimeMode() === "demo") return null;
+  const provider = (process.env.AI_PROVIDER ?? "meta").toLowerCase();
   if (provider === "meta") {
-    const apiKey = process.env.MODEL_API_KEY || process.env.MUSE_API_KEY || process.env.META_API_KEY || process.env.META_MODEL_API_KEY;
+    const apiKey = museApiKey();
     if (!apiKey) return null;
     const effortDefault = agent === "intent" ? "low" : process.env.META_REASONING_EFFORT || "medium";
     return new MetaResponsesClient({

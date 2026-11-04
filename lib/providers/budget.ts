@@ -1,3 +1,4 @@
+import { externalProvidersEnabled } from "@/lib/runtimeMode";
 import type { ProviderUsage } from "@/lib/trip/types";
 
 /**
@@ -78,12 +79,12 @@ export function getBudget(provider: "tomtom" | "overpass" | "osrm" | "nominatim"
     overpass: { enabled: process.env.OVERPASS_LIVE !== "0", window: 40, session: 25 },
     osrm: { enabled: process.env.OSRM_LIVE !== "0", window: 30, session: 15 },
     nominatim: { enabled: process.env.NOMINATIM_LIVE !== "0", window: 60, session: 40 },
-    "open-meteo": { enabled: true, window: 200, session: 120 }
+    "open-meteo": { enabled: process.env.OPEN_METEO_LIVE !== "0", window: 200, session: 120 }
   };
   const d = defaults[provider];
   b = new RequestBudget({
     provider,
-    enabled: d.enabled,
+    enabled: externalProvidersEnabled() && d.enabled,
     windowLimit: n(process.env[`${P}_WINDOW_LIMIT`], d.window),
     windowMs: n(process.env[`${P}_WINDOW_MS`], 60 * 60 * 1000),
     sessionLimit: n(process.env[`${P}_SESSION_LIMIT`], d.session)

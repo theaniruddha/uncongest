@@ -42,7 +42,7 @@ export default function StrategicPanel({
       <div className="flex items-center justify-between">
         <h2 className="text-base font-bold text-navy">Later on this trip</h2>
         <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${STATUS_STYLE[state.status] ?? ""}`} data-testid="strategic-status">
-          Strategic: {label}
+          Strategic: {label}{state.status === "fallback" || state.status === "timeout" ? " · Recorded/Mock" : state.status === "completed" ? " · Live Muse" : ""}
           {state.ms != null && state.status !== "running" ? ` · ${(state.ms / 1000).toFixed(1)} s` : ""}
         </span>
       </div>

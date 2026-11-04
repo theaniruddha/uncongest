@@ -1,3 +1,4 @@
+import { externalProvidersEnabled } from "@/lib/runtimeMode";
 import type { Need, StopCandidate } from "@/lib/domain/types";
 import type { RouteModel } from "@/lib/route/model";
 import type { ProviderUsage } from "@/lib/trip/types";
@@ -28,7 +29,7 @@ export class RoutePlaceProvider implements PlaceProvider {
     private readonly route: RouteModel,
     opts: { sessionId?: string; tomtomVerifyTop?: number; fetchImpl?: typeof fetch; cacheOnly?: boolean } = {}
   ) {
-    this.cacheOnly = opts.cacheOnly === true;
+    this.cacheOnly = opts.cacheOnly === true || !externalProvidersEnabled();
     this.sessionId = opts.sessionId;
     this.tomtomVerifyTop = Math.max(0, opts.tomtomVerifyTop ?? 0);
     this.fetchImpl = opts.fetchImpl;
@@ -152,6 +153,7 @@ export async function prefetchWindows(
   windows: KmWindow[],
   opts: { sessionId?: string; fetchImpl?: typeof fetch; cacheOnly?: boolean } = {}
 ): Promise<{ trace: string[]; candidates: StopCandidate[] }> {
+  opts = { ...opts, cacheOnly: opts.cacheOnly === true || !externalProvidersEnabled() };
   const tiles = new Map<string, KmWindow>();
   for (const w of windows) for (const t of tilesFor(route, w)) tiles.set(`${t.minKm}`, t);
   const trace: string[] = [];

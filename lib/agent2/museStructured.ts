@@ -1,3 +1,5 @@
+import { museEnabled } from "@/lib/runtimeMode";
+import { museApiKey, resetLlmRateSlots, takeLlmRateSlot } from "./llmSafety";
 import type { ZodType, ZodTypeDef } from "zod";
 
 /**
@@ -47,23 +49,12 @@ export function resetMuseStructured(): void {
   stats.timeouts = 0;
   stats.failures = 0;
   stats.totalMs = [];
-  callLog.length = 0;
-}
-
-const callLog: number[] = [];
-function takeRateSlot(): boolean {
-  const raw = process.env.LLM_MAX_CALLS_PER_10_MIN;
-  const limit = raw !== undefined && raw !== "" && Number.isFinite(Number(raw)) ? Number(raw) : 30;
-  const now = Date.now();
-  while (callLog.length && now - callLog[0] > 10 * 60_000) callLog.shift();
-  if (callLog.length >= limit) return false;
-  callLog.push(now);
-  return true;
+  resetLlmRateSlots();
 }
 
 function museConfig(): { baseUrl: string; apiKey: string; model: string } | null {
-  if ((process.env.AI_PROVIDER ?? "mock").toLowerCase() !== "meta") return null;
-  const apiKey = process.env.MODEL_API_KEY || process.env.MUSE_API_KEY || process.env.META_API_KEY;
+  if (!museEnabled()) return null;
+  const apiKey = museApiKey();
   if (!apiKey) return null;
   return {
     baseUrl: (process.env.META_API_BASE || "https://api.meta.ai/v1").replace(/\/$/, ""),
@@ -100,8 +91,8 @@ export async function callMuseStructured<T>(req: MuseStructuredRequest<T>): Prom
   const started = Date.now();
   const elapsed = () => Date.now() - started;
   const cfg = museConfig();
-  if (!cfg) return { ok: false, reason: "disabled", detail: "AI_PROVIDER is not \"meta\" or no Muse API key is configured", ms: 0 };
-  if (!takeRateSlot()) {
+  if (!cfg) return { ok: false, reason: "disabled", detail: "Muse is disabled or no Muse API key is configured", ms: 0 };
+  if (!takeLlmRateSlot()) {
     stats.failures++;
     return { ok: false, reason: "rate_limited", detail: "LLM rate limit reached (LLM_MAX_CALLS_PER_10_MIN)", ms: 0 };
   }
@@ -127,16 +118,16 @@ export async function callMuseStructured<T>(req: MuseStructuredRequest<T>): Prom
       signal: controller.signal
     });
     if (!res.ok) {
-      const detail = (await res.text().catch(() => "")).slice(0, 300);
+      await res.body?.cancel();
       stats.failures++;
       record(elapsed());
-      return { ok: false, reason: res.status === 429 ? "rate_limited" : "http", detail: `muse http ${res.status}${detail ? `: ${detail}` : ""}`, ms: elapsed() };
+      return { ok: false, reason: res.status === 429 ? "rate_limited" : "http", detail: `muse http ${res.status}`, ms: elapsed() };
     }
     const json = await res.json();
     const ms = elapsed();
     record(ms);
     const { text, status } = outputText(json);
-    console.info(`[ai:strategic] meta:${cfg.model} effort=${req.effort} ${ms}ms status=${status} usage=${JSON.stringify(json?.usage ?? null)}`);
+    console.info(`[ai:${req.schemaName}] meta:${cfg.model} effort=${req.effort} ${ms}ms status=${status} usage=${JSON.stringify(json?.usage ?? null)}`);
     if (!text.trim()) {
       stats.failures++;
       return { ok: false, reason: "invalid", detail: `muse returned no output text (status ${status})`, ms };
@@ -163,7 +154,7 @@ export async function callMuseStructured<T>(req: MuseStructuredRequest<T>): Prom
       return { ok: false, reason: "timeout", detail: `muse timeout after ${req.deadlineMs} ms`, ms };
     }
     stats.failures++;
-    return { ok: false, reason: "http", detail: `muse request failed: ${(err as Error).message}`.slice(0, 300), ms };
+    return { ok: false, reason: "http", detail: "Muse network request failed", ms };
   } finally {
     clearTimeout(timer);
   }

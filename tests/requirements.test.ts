@@ -125,6 +125,7 @@ beforeEach(() => {
   prefetchMock.mockClear();
   vi.unstubAllEnvs();
   vi.stubEnv("AI_PROVIDER", "mock");
+  vi.stubEnv("UNCONGEST_MODE", "full-live");
 });
 afterEach(() => {
   vi.unstubAllEnvs();

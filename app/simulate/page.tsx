@@ -1,5 +1,6 @@
 import Simulator from "@/components/Simulator";
 import Link from "next/link";
+import Connections from "@/components/Connections";
 
 export const metadata = {
   title: "Uncongest — Highway 401 simulation"
@@ -14,6 +15,7 @@ export default function SimulatePage({ searchParams }: { searchParams: { demo?: 
           SIMULATED trip · real route &amp; exits (OSM) · live weather optional · fictional businesses
         </span>
       </header>
+      <div className="px-3 pt-3"><Connections /></div>
       <Simulator autoDemo={searchParams.demo === "1"} />
     </main>
   );

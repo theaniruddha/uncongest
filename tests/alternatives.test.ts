@@ -93,6 +93,7 @@ function scenario() {
 
 let tmpRoot = "";
 beforeEach(() => {
+  vi.stubEnv("UNCONGEST_MODE", "full-live");
   tmpRoot = mkdtempSync(path.join(os.tmpdir(), "uncongest-alts-"));
   process.env.UNCONGEST_CACHE_DIR = path.join(tmpRoot, "cache");
   process.env.UNCONGEST_RECORDED_DIR = path.join(tmpRoot, "recorded");
@@ -104,6 +105,7 @@ beforeEach(() => {
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
   for (const k of ["UNCONGEST_CACHE_DIR", "UNCONGEST_RECORDED_DIR", "BORDER_LOOKUP", "OSRM_SESSION_LIMIT"]) delete process.env[k];
   rmSync(tmpRoot, { recursive: true, force: true });

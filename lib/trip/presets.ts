@@ -68,16 +68,17 @@ export const SCENARIO_PRESETS: ScenarioPreset[] = [
     id: "demo-3min",
     title: "▶ 3-minute demo",
     blurb:
-      "Simulated Mississauga home → Letchworth at 10:15, two kids, hungry later. Lunch comes due near the Niagara border crossing, so Strategic compares stopping before vs after it; Tactical recommends; then try 'Urgent washroom' or 'Rain'.",
+      "Toronto → Montréal, one car with two kids. Recorded road geometry, fictional stops and mock weather; try Hungry now, compare recommendations, select a stop and confirm the visit.",
     setup: (today) =>
       build({
-        origin: HOME_PRESET,
-        destination: LETCHWORTH,
-        departure: departAt(today, "10:15"),
+        origin: TORONTO,
+        destination: MONTREAL,
+        departure: departAt(today, "09:30"),
+        dataMode: "demo",
         mood: ["relaxed", "hungry"],
         mealPreference: "auto",
         mealHistory: { kind: "unknown" },
-        cars: [car("car_a", { adults: 2, kids: 2 })]
+        cars: [car("car_a", { adults: 2, kids: 2, dietary: ["vegetarian"] })]
       })
   },
   {

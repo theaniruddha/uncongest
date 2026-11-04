@@ -22,6 +22,7 @@ export interface VersionIntent {
   restroomUrgent?: unknown;
   notHungry?: unknown;
   dietary: readonly string[];
+  kids?: boolean;
 }
 
 export interface VersionSetup {
@@ -34,6 +35,7 @@ export interface VersionSetup {
   mealPreference: unknown;
   mealHistory: unknown;
   customMeal?: unknown;
+  maxDetourMinutes?: number;
   cars: Array<{ id: string; speedKph: number; startOffsetMinutes: number }>;
 }
 
@@ -75,14 +77,15 @@ function setupSignature(s: VersionSetup) {
     mood: [...s.mood].sort(),
     mealPreference: s.mealPreference ?? null,
     mealHistory: s.mealHistory ?? null,
-    customMeal: s.customMeal ?? null
+    customMeal: s.customMeal ?? null,
+    maxDetourMinutes: s.maxDetourMinutes ?? null
   };
 }
 
 function intentSignature(cars: VersionSetup["cars"], intents: VersionInput["intents"]) {
   return cars.map((c) => {
     const i = intents[c.id];
-    return [c.id, i?.needs.map((n) => n.need).sort() ?? [], i?.hungerLevel ?? null, i?.restroomUrgent ?? null, i?.notHungry ?? null, i ? [...i.dietary].sort() : []];
+    return [c.id, i?.needs.map((n) => n.need).sort() ?? [], i?.hungerLevel ?? null, i?.restroomUrgent ?? null, i?.notHungry ?? null, i?.kids ?? false, i ? [...i.dietary].sort() : []];
   });
 }
 

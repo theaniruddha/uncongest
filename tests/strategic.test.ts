@@ -41,7 +41,7 @@ vi.mock("@/lib/providers/routePlaces", async (importOriginal) => {
 
 import { clearStrategicCache, runStrategicPlanner, strategicInputSchema, type ModelPlan, type StrategicDeps } from "@/lib/agent2/strategic";
 import { callMuseStructured, resetMuseStructured, museCallStats } from "@/lib/agent2/museStructured";
-import { computeFutureWindows, runTools, type ToolContext, type ToolImpls, type ToolName, TOOL_ORDER } from "@/lib/agent2/strategicTools";
+import { computeFutureWindows, runTools, DEFAULT_TOOLS, type ToolContext, type ToolImpls, type ToolName, TOOL_ORDER } from "@/lib/agent2/strategicTools";
 
 // ---- synthetic straight 300 km route eastward ----
 const coords: Array<[number, number]> = [];
@@ -236,6 +236,7 @@ describe("runStrategicPlanner", () => {
   });
 
   it("Muse timeout → status timeout with fallback plan within deadline + margin", async () => {
+    vi.stubEnv("UNCONGEST_MODE", "live-muse");
     vi.stubEnv("AI_PROVIDER", "meta");
     vi.stubEnv("MUSE_API_KEY", "test-key");
     vi.stubGlobal(
@@ -257,6 +258,7 @@ describe("runStrategicPlanner", () => {
   });
 
   it("invalid Muse JSON → deterministic fallback, error 'invalid'", async () => {
+    vi.stubEnv("UNCONGEST_MODE", "live-muse");
     vi.stubEnv("AI_PROVIDER", "meta");
     vi.stubEnv("MUSE_API_KEY", "test-key");
     vi.stubGlobal(
@@ -310,6 +312,7 @@ describe("callMuseStructured", () => {
   });
 
   it("posts non-streaming json_schema text.format and validates the output", async () => {
+    vi.stubEnv("UNCONGEST_MODE", "live-muse");
     vi.stubEnv("AI_PROVIDER", "meta");
     vi.stubEnv("MUSE_API_KEY", "test-key");
     const fetchMock = vi.fn(async (_url: string, _init: RequestInit) =>
@@ -328,11 +331,39 @@ describe("callMuseStructured", () => {
   });
 
   it("rate guard returns rate_limited", async () => {
+    vi.stubEnv("UNCONGEST_MODE", "live-muse");
     vi.stubEnv("AI_PROVIDER", "meta");
     vi.stubEnv("MUSE_API_KEY", "test-key");
     vi.stubEnv("LLM_MAX_CALLS_PER_10_MIN", "0");
     const { z } = await import("zod");
     const r = await callMuseStructured({ system: "s", user: "u", schemaName: "x", jsonSchema: {}, zod: z.object({}), effort: "low", deadlineMs: 100 });
     expect(!r.ok && r.reason).toBe("rate_limited");
+  });
+});
+
+
+describe("strategic demo evidence", () => {
+  it("provides labeled fictional places and dated weather without network access", async () => {
+    vi.stubEnv("UNCONGEST_MODE", "demo");
+    const fetchMock = vi.fn(() => { throw new Error("offline test must not fetch"); });
+    vi.stubGlobal("fetch", fetchMock);
+    const input = { ...baseInput(), dataMode: "demo" as const, weatherCondition: "rain" as const };
+    const ctx: ToolContext = {
+      input, route, tripRoute, cruiseSpeedKph: 100, nowUtc: new Date(input.departureUtc),
+      windows: [{ id: "demo", fromKm: 20, toKm: 300, kinds: ["meal"], reason: "lunch", expectedLocalFrom: "11:00", expectedLocalTo: "14:00" }]
+    };
+    const places = await DEFAULT_TOOLS.placesInWindows(ctx);
+    expect(places.provenance).toBe("simulated");
+    expect(places.summary).toMatch(/fictional/);
+    const data = places.data as { candidates: Array<{ isMock: boolean; source: string }> };
+    expect(data.candidates.length).toBeGreaterThan(0);
+    expect(data.candidates.every((c) => c.isMock && /fictional/.test(c.source))).toBe(true);
+    const weather = await DEFAULT_TOOLS.weatherAtWaypoints(ctx);
+    expect(weather.provenance).toBe("simulated");
+    expect(weather.summary).toMatch(/Mock weather snapshot/);
+    const points = (weather.data as { points: Array<{ recordedAt: string; condition: string }> }).points;
+    expect(points.length).toBeGreaterThan(0);
+    expect(points.every((p) => /^2026-/.test(p.recordedAt) && p.condition === "rain")).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

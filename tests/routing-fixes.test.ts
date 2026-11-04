@@ -53,6 +53,7 @@ const callsTo = (f: ReturnType<typeof vi.fn>, host: string) => f.mock.calls.filt
 
 let tmpRoot = "";
 beforeEach(() => {
+  vi.stubEnv("UNCONGEST_MODE", "full-live");
   tmpRoot = mkdtempSync(path.join(os.tmpdir(), "uncongest-routing-fixes-"));
   process.env.UNCONGEST_CACHE_DIR = path.join(tmpRoot, "cache");
   process.env.UNCONGEST_RECORDED_DIR = path.join(tmpRoot, "recorded");
@@ -65,6 +66,7 @@ beforeEach(() => {
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();

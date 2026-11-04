@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { evaluateUrgency } from "@/lib/domain/urgency";
 import { EMPTY_MEMORY, watch, type WatchInput } from "@/lib/domain/watcher";
 import { decideWithExploration, dietFit, evaluateCandidates } from "@/lib/domain/engine";
@@ -234,8 +234,16 @@ describe("compatibility", () => {
 
 /* ---------- border detection fallback (no Overpass) ---------- */
 describe("country-change border fallback", () => {
+  beforeEach(() => {
+    vi.stubEnv("UNCONGEST_MODE", "full-live");
+    vi.stubEnv("BORDER_LOOKUP", "1");
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    const { resetBudgets } = await import("@/lib/providers/budget");
+    resetBudgets();
+  });
   it("locates a CA→US crossing by binary search and never invents one for same-country trips", async () => {
-    process.env.BORDER_LOOKUP = "1";
     const { countryChangeCrossing } = await import("@/lib/providers/routing");
     const { clearGeocodeCache } = await import("@/lib/providers/geocode");
     const { resetBudgets } = await import("@/lib/providers/budget");
@@ -256,6 +264,5 @@ describe("country-change border fallback", () => {
     const same = (async () => new Response(JSON.stringify({ address: { country_code: "ca" } }), { status: 200 })) as unknown as typeof fetch;
     clearGeocodeCache();
     expect(await countryChangeCrossing({ ...route, id: "b2" }, { fetchImpl: same })).toEqual([]);
-    process.env.BORDER_LOOKUP = "0";
   }, 30000);
 });

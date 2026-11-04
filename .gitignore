@@ -4,9 +4,8 @@ out/
 coverage/
 playwright-report/
 test-results/
-.env
-.env.local
-.env.*.local
+.env*
+!.env.example
 .vercel/
 .DS_Store
 *.log

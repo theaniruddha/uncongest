@@ -125,6 +125,7 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
   const [memory, setMemory] = useState<WatchMemory>(EMPTY_MEMORY);
   const memoryRef = useRef<WatchMemory>(EMPTY_MEMORY);
   const loadingRef = useRef(false);
+  const tripGeneration = useRef(0);
 
   // ---- conversation / UI ----
   const [chatText, setChatText] = useState("");
@@ -261,6 +262,7 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
   const runRecommendation = useCallback(
     async (trigger: "watcher" | "manual", key?: string) => {
       if (loadingRef.current) return;
+      const generation = tripGeneration.current;
       loadingRef.current = true;
       setLoading(true);
       const body = buildRequest();
@@ -276,6 +278,7 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
           body: JSON.stringify(body)
         });
         const data = await res.json().catch(() => null);
+        if (generation !== tripGeneration.current) return;
         setAgent2Inspect({ request: body, status: res.status, response: data });
         if (!res.ok) {
           const err: ApiError = { status: res.status, message: data?.error ?? `HTTP ${res.status}`, issues: data?.issues };
@@ -312,12 +315,15 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
           }
         }
       } catch (err) {
+        if (generation !== tripGeneration.current) return;
         setError({ status: 0, message: `network error: ${(err as Error).message}` });
         setResultStale(true);
         logNow("error", `Agent 2 FAILED (network: ${(err as Error).message})`);
       } finally {
-        loadingRef.current = false;
-        setLoading(false);
+        if (generation === tripGeneration.current) {
+          loadingRef.current = false;
+          setLoading(false);
+        }
       }
     },
     [buildRequest, elapsed, logNow, voiceOn]
@@ -400,6 +406,9 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
 
   // ---- actions ----
   const reset = () => {
+    tripGeneration.current += 1;
+    loadingRef.current = false;
+    setLoading(false);
     setPlaying(false);
     setElapsed(0);
     setSimCars([defaultSimCar("car_a")]);
@@ -482,6 +491,7 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
   const sendMessage = async (text: string, carId = chatCar, source = chatSource) => {
     const t = text.trim();
     if (!t || chatBusy) return;
+    const generation = tripGeneration.current;
     setChatBusy(true);
     const body = {
       carId,
@@ -509,17 +519,20 @@ export default function Simulator({ autoDemo = false }: { autoDemo?: boolean }) 
     try {
       const res = await fetch("/api/intent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const data = await res.json().catch(() => null);
+      if (generation !== tripGeneration.current) { setChatBusy(false); return; }
       setAgent1Inspect({ request: body, status: res.status, response: data });
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       out = data;
     } catch (err) {
       out = { ...regexIntentUpdate(carId, t), provider: `client regex fallback (${(err as Error).message})` };
     }
+    if (generation !== tripGeneration.current) { setChatBusy(false); return; }
     const result = out!;
     setIntents((prev) => {
       const next = { ...prev };
       for (const u of result.updates) {
-        const cur = next[u.carId] ?? emptyCarIntent(u.carId);
+        if (!next[u.carId]) continue;
+        const cur = next[u.carId];
         next[u.carId] = applyIntentUpdate(cur, u, elapsed, u.carId === carId ? t : undefined);
       }
       return next;

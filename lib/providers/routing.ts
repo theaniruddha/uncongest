@@ -1,3 +1,4 @@
+import { externalProvidersEnabled } from "@/lib/runtimeMode";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import routeFixture from "@/data/routes/toronto-montreal.json";
@@ -867,6 +868,7 @@ export async function generateAlternatives(
       attachAlternatives(routeId, disk);
       return disk;
     }
+    if (!externalProvidersEnabled()) return main.alternatives.slice(0, max);
     const t0 = Date.now();
     const native = main.alternatives.filter((a) => !a.via);
     const accepted: RouteAlternative[] = [...native];

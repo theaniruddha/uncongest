@@ -335,6 +335,8 @@ describe("per-car intent (Agent 1 state)", () => {
 });
 
 describe("weather at arrival (Open-Meteo, cached, failure-labelled)", () => {
+  beforeEach(() => { vi.stubEnv("UNCONGEST_MODE", "full-live"); });
+  afterEach(() => { vi.unstubAllEnvs(); });
   const hourly = (base: number) => ({
     time: ["2026-11-03T12:00", "2026-11-03T13:00", "2026-11-03T14:00"],
     temperature_2m: [base, base + 1, base + 2],
