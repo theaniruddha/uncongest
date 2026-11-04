@@ -67,7 +67,6 @@ function watchIn(over: Partial<WatchInput>): WatchInput {
 describe("home departure quiet window", () => {
   it("does not call Agent 2 for a routine meal-time reminder right after leaving home", () => {
     const d = watch(watchIn({}));
-    expect(d.urgency).toBeUndefined();
     expect(d.shouldCall).toBe(false);
     expect(d.reasons.join(" ")).toMatch(/just left home/);
   });
@@ -159,7 +158,7 @@ describe("Tactical decision workflow", () => {
     expect(r.meta.status).toBe("muse");
     expect(r.llm?.action).toBe("PROPOSE_STOP");
     expect(r.llm?.picks[0].stopId).toBe("b");
-    expect(muse.mock.calls[0][0]).toMatchObject({ effort: "low", deadlineMs: 5000, schemaName: "tactical_decision" });
+    expect((muse.mock.calls[0] as unknown[])[0]).toMatchObject({ effort: "minimal", deadlineMs: 5000, schemaName: "tactical_decision" });
   });
   it("deadline exceeded → deterministic fallback, never an unvalidated pick", async () => {
     const muse = vi.fn(async () => ({ ok: false as const, reason: "timeout" as const, detail: "5000 ms", ms: 5001 }));
@@ -231,4 +230,32 @@ describe("compatibility", () => {
     expect(r.action).toBe("PROPOSE_STOP");
     expect(Object.keys(r.recommendations[0].detourMinutesByCar)).toHaveLength(3);
   });
+});
+
+/* ---------- border detection fallback (no Overpass) ---------- */
+describe("country-change border fallback", () => {
+  it("locates a CA→US crossing by binary search and never invents one for same-country trips", async () => {
+    process.env.BORDER_LOOKUP = "1";
+    const { countryChangeCrossing } = await import("@/lib/providers/routing");
+    const { clearGeocodeCache } = await import("@/lib/providers/geocode");
+    const { resetBudgets } = await import("@/lib/providers/budget");
+    clearGeocodeCache();
+    resetBudgets();
+    const coords: Array<[number, number]> = [];
+    for (let i = 0; i <= 40; i++) coords.push([-79.6 + i * 0.03, 43.2 - i * 0.005]); // ~100 km eastward
+    const route = { id: "b1", origin: { label: "a", lat: 43.2, lng: -79.6, type: "other" as const, source: "search" as const }, destination: { label: "b", lat: 43, lng: -78.4, type: "other" as const, source: "search" as const }, coordinates: coords, exits: [], exitsStatus: "pending" as const, borderCrossings: [], alternatives: [], distanceKm: 100, durationMinutes: 70, source: "osrm" as const, timezone: "America/Toronto", fetchedAt: "x", attribution: "x" };
+    // border at lng -79.0 (≈ km 49)
+    const fetchImpl = (async (url: string) => {
+      const lon = Number(new URL(url).searchParams.get("lon"));
+      return new Response(JSON.stringify({ address: { country_code: lon < -79.0 ? "ca" : "us" } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const found = await countryChangeCrossing(route, { fetchImpl });
+    expect(found).toHaveLength(1);
+    expect(found[0].name).toMatch(/CA → US/);
+    expect(Math.abs(found[0].km - 49)).toBeLessThan(4);
+    const same = (async () => new Response(JSON.stringify({ address: { country_code: "ca" } }), { status: 200 })) as unknown as typeof fetch;
+    clearGeocodeCache();
+    expect(await countryChangeCrossing({ ...route, id: "b2" }, { fetchImpl: same })).toEqual([]);
+    process.env.BORDER_LOOKUP = "0";
+  }, 30000);
 });

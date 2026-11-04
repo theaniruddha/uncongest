@@ -542,7 +542,8 @@ async function computeExits(base: TripRoute, opts: ResolveOpts): Promise<TripRou
     }
   }
   let exits = elements ? exitsFromJunctions(full, elements, base.distanceKm) : [];
-  const borderCrossings = elements ? borderCrossingsFrom(full, elements, base.distanceKm) : [];
+  let borderCrossings = elements ? borderCrossingsFrom(full, elements, base.distanceKm) : [];
+  if (borderCrossings.length === 0) borderCrossings = await countryChangeCrossing(base, opts);
   let exitSource = "Overpass motorway_junction";
   const degraded = exits.length === 0;
   if (degraded) {
@@ -664,4 +665,40 @@ export function clearRoutingCache(): void {
   geometryById.clear();
   geometryInflight.clear();
   exitsInflight.clear();
+}
+
+
+/**
+ * Fallback border detection that does not depend on Overpass: if origin and destination are in
+ * different countries (Nominatim reverse, zoom 3), binary-search the route for the change point
+ * (~2 km precision, ≤ 10 throttled lookups). Never invents a crossing for same-country trips.
+ */
+export async function countryChangeCrossing(
+  base: TripRoute,
+  opts: { sessionId?: string; fetchImpl?: typeof fetch } = {}
+): Promise<TripRoute["borderCrossings"]> {
+  if (process.env.BORDER_LOOKUP === "0") return [];
+  try {
+    const { countryAt } = await import("./geocode");
+    const model = routeModelFor(base);
+    const a = model.pointAtKm(0);
+    const b = model.pointAtKm(model.totalKm);
+    const [ca, cb] = await Promise.all([countryAt(a.lat, a.lng, opts), countryAt(b.lat, b.lng, opts)]);
+    if (!ca || !cb || ca === cb) return [];
+    let lo = 0;
+    let hi = model.totalKm;
+    for (let i = 0; i < 10 && hi - lo > 2; i++) {
+      const mid = (lo + hi) / 2;
+      const p = model.pointAtKm(mid);
+      const c = await countryAt(p.lat, p.lng, opts);
+      if (c === ca) lo = mid;
+      else hi = mid;
+    }
+    const km = (lo + hi) / 2;
+    const p = model.pointAtKm(km);
+    return [{ km: Math.round(km * 10) / 10, name: `${ca.toUpperCase()} → ${cb.toUpperCase()} border (located via Nominatim country lookups)`, lat: p.lat, lng: p.lng }];
+  } catch (err) {
+    console.warn(`[routing] border lookup failed: ${(err as Error).message}`);
+    return [];
+  }
 }

@@ -127,8 +127,27 @@ export async function reverseGeocode(
   }
 }
 
+const countryCache = new Map<string, string | null>();
+
+/** ISO country code at a point (Nominatim reverse, zoom 3), throttled + cached + budgeted. */
+export async function countryAt(lat: number, lng: number, opts: { sessionId?: string; fetchImpl?: typeof fetch } = {}): Promise<string | null> {
+  const key = `${lat.toFixed(2)},${lng.toFixed(2)}`;
+  if (countryCache.has(key)) {
+    getBudget("nominatim").hit();
+    return countryCache.get(key)!;
+  }
+  const refused = getBudget("nominatim").take(opts.sessionId);
+  if (refused) throw new GeocodeUnavailableError(refused);
+  const params = new URLSearchParams({ format: "jsonv2", lat: lat.toFixed(5), lon: lng.toFixed(5), zoom: "3", addressdetails: "1" });
+  const json = (await throttled(() => nominatimGet(`${BASE}/reverse?${params.toString()}`, opts.fetchImpl))) as { address?: { country_code?: string } } | null;
+  const cc = json?.address?.country_code?.toLowerCase() ?? null;
+  countryCache.set(key, cc);
+  return cc;
+}
+
 /** For tests. */
 export function clearGeocodeCache(): void {
+  countryCache.clear();
   searchCache.clear();
   reverseCache.clear();
 }

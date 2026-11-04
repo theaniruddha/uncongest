@@ -9,7 +9,7 @@ import type { ZodType, ZodTypeDef } from "zod";
  * rolling rate guard (LLM_MAX_CALLS_PER_10_MIN, default 30).
  */
 
-export type MuseEffort = "low" | "medium" | "high";
+export type MuseEffort = "minimal" | "low" | "medium" | "high";
 export type MuseFailureReason = "disabled" | "timeout" | "http" | "invalid" | "rate_limited";
 
 export interface MuseStructuredRequest<T> {

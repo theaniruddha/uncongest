@@ -136,9 +136,10 @@ export async function runTactical(
     schemaName: "tactical_decision",
     jsonSchema: TACTICAL_JSON_SCHEMA as unknown as Record<string, unknown>,
     zod: tacticalDecisionSchema,
-    effort: (process.env.TACTICAL_EFFORT as "low" | "medium" | "high") || "low",
+    // "minimal" measured ≈ 2.5 s vs ≈ 6 s for "low" on this prompt (muse-spark-1.3); keeps Tactical inside 5 s.
+    effort: (process.env.TACTICAL_EFFORT as "minimal" | "low" | "medium" | "high") || "minimal",
     deadlineMs,
-    maxOutputTokens: 4000
+    maxOutputTokens: 2000
   });
   if (!r.ok) {
     const status: TacticalMeta["status"] = r.reason === "timeout" ? "timeout" : r.reason === "invalid" ? "invalid" : r.reason === "disabled" ? "disabled" : "error";

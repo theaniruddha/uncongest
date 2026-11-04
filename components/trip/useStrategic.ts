@@ -40,6 +40,9 @@ export function useStrategic(opts: {
   const onResultRef = useRef(opts.onResult);
   onResultRef.current = opts.onResult;
   const inflight = useRef<string | null>(null);
+  const staleCount = useRef(0);
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const run = useCallback(async (reason: string) => {
     const input = buildRef.current();
@@ -60,28 +63,26 @@ export function useStrategic(opts: {
       const plan = data.plan as StrategicPlan;
       const meta = data.meta as StrategicRunMeta;
       const current = plan.routeVersion === versions.current.route && plan.contextVersion === versions.current.context;
+      // Side effects stay OUT of state updaters (React may call updaters twice in dev).
       if (!current) {
-        setState((s) => {
-          const next = { ...s, status: "stale" as const, ms, runs: s.runs + 1, staleRejected: s.staleRejected + 1 };
-          onResultRef.current?.({ ...next, plan, meta }, false);
-          return next;
-        });
+        staleCount.current += 1;
+        const next: StrategicState = { ...stateRef.current, status: "stale", ms, runs: stateRef.current.runs + 1, staleRejected: staleCount.current };
+        setState(next);
+        onResultRef.current?.({ ...next, plan, meta }, false);
         return;
       }
-      setState((s) => {
-        const next: StrategicState = {
-          status: meta.status === "completed" || meta.status === "cached" || meta.status === "fallback" || meta.status === "timeout" ? meta.status : "completed",
-          plan,
-          meta,
-          ms,
-          routeVersion: plan.routeVersion,
-          contextVersion: plan.contextVersion,
-          runs: s.runs + 1,
-          staleRejected: s.staleRejected
-        };
-        onResultRef.current?.(next, true);
-        return next;
-      });
+      const next: StrategicState = {
+        status: meta.status === "completed" || meta.status === "cached" || meta.status === "fallback" || meta.status === "timeout" ? meta.status : "completed",
+        plan,
+        meta,
+        ms,
+        routeVersion: plan.routeVersion,
+        contextVersion: plan.contextVersion,
+        runs: stateRef.current.runs + 1,
+        staleRejected: staleCount.current
+      };
+      setState(next);
+      onResultRef.current?.(next, true);
       void reason;
     } catch (e) {
       setState((s) => ({ ...s, status: "error", error: (e as Error).message, runs: s.runs + 1 }));
