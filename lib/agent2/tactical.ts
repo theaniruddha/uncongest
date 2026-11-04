@@ -65,7 +65,7 @@ export interface StrategicHint {
 }
 
 export interface TacticalMeta {
-  status: "muse" | "fallback" | "timeout" | "invalid" | "disabled" | "error";
+  status: "muse" | "overridden" | "fallback" | "timeout" | "invalid" | "disabled" | "error";
   provider: string;
   ms: number;
   detail?: string;
@@ -119,6 +119,27 @@ export function toLlmDecision(d: TacticalDecision): LlmDecision {
     picks: d.decision === "RECOMMEND" ? d.picks.map((p, i) => ({ stopId: p.stopId, kind: i === 0 ? "BEST_FIT" : i === 1 ? "FASTEST" : "ALTERNATIVE", reason: p.reason, tradeoffs: p.tradeoffs })) : [],
     speakMessage: d.headline || undefined
   };
+}
+
+/**
+ * Did the engine actually act on Muse's decision? Muse's choice is overridden when the engine's action differs
+ * (e.g. SEARCH_FARTHER/STAY_SILENT ignored above low urgency) or when none of its RECOMMEND picks survived validation.
+ */
+export function reconcileTactical(
+  d: TacticalDecision,
+  result: { action: string; recommendations: Array<{ stopId: string }> }
+): { overridden: false } | { overridden: true; detail: string; decision?: TacticalDecisionKind } {
+  const llmAction = toLlmDecision(d).action;
+  const pickIds = d.decision === "RECOMMEND" ? d.picks.map((p) => p.stopId) : [];
+  const picksDropped = pickIds.length > 0 && !result.recommendations.some((r) => pickIds.includes(r.stopId));
+  if (result.action === llmAction && !picksDropped) return { overridden: false };
+  const decision: TacticalDecisionKind | undefined =
+    result.action === "PROPOSE_STOP" ? "RECOMMEND" : result.action === "REPLAN" ? "REPLAN" : result.action === "STAY_SILENT" ? "STAY_SILENT" : undefined;
+  const detail =
+    result.action !== llmAction
+      ? `Muse chose ${d.decision}, but urgency requires a stop now — deterministic ranking used`
+      : `Muse's picks (${pickIds.join(", ")}) failed validation — deterministic ranking used`;
+  return { overridden: true, detail, decision };
 }
 
 export async function runTactical(

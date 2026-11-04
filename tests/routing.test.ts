@@ -211,8 +211,11 @@ describe("resolveRoute", () => {
     clock.mockReturnValue(t0 + 11 * 60 * 1000);
     const good = mockFetch({});
     const fresh = await resolveRoute(ORIGIN, DEST, { fetchImpl: good });
-    expect(fresh.source).toBe("osrm");
+    // geometry is still in memory: only the exits are retried (no new OSRM request)
+    expect(fresh.source).toBe("cache");
     expect(fresh.exits.map((e) => e.ref)).toEqual(["10A", "25"]);
+    expect(fresh.exitsStatus).toBe("ready");
+    expect(good.mock.calls.some(([u]) => String(u).includes("router.project-osrm.org"))).toBe(false);
 
     // healthy routes keep the 24 h TTL
     clock.mockReturnValue(t0 + 11 * 60 * 1000 + 23 * 60 * 60 * 1000);

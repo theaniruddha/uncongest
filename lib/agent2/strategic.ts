@@ -332,7 +332,14 @@ export function buildFallbackPlan(ctx: PlanCtx): ModelPlan {
       .sort((a, b) => Number(b.restroomsVerified === true) - Number(a.restroomsVerified === true) || a.km - b.km)
       .slice(0, 4);
     const label = kind === "meal" ? (/dinner/.test(w.reason) ? "Dinner" : /lunch/.test(w.reason) ? "Lunch" : "Meal") : kind === "rest_break" ? "Rest break" : "Coffee";
-    const placeNote = pl && pl.provenance !== "unavailable" ? `${inWindow.length} suitable place(s) found` : "place lookup unavailable";
+    // Per-window coverage: a window whose tiles were (mostly) never fetched must not claim "0 found".
+    const coverage = pl?.data.perWindow.find((p) => p.windowId === w.id)?.coverage;
+    const placeNote =
+      !pl || pl.provenance === "unavailable"
+        ? "place lookup unavailable"
+        : coverage !== undefined && coverage < 0.5 && inWindow.length === 0
+          ? "place data not available yet"
+          : `${inWindow.length} suitable place(s) found`;
     opportunities.push({
       id: `fb-${w.id}`,
       kind,
@@ -452,7 +459,14 @@ interface CacheEntry {
   at: number;
   ttl: number;
   res: StrategicResponse;
+  /** Trip position the plan was computed for (a hit must be close to the request's position). */
+  leadKm: number;
+  elapsed: number;
 }
+/** A cached plan is reused only while the trip is within this distance / time of where it was planned. */
+const REUSE_MAX_KM = 5;
+const REUSE_MAX_MINUTES = 10;
+const LEAD_BUCKET_KM = 10;
 const CACHE_TTL_MS = 10 * 60_000;
 const SHORT_TTL_MS = 60_000;
 const cache = new Map<string, CacheEntry>();
@@ -463,7 +477,11 @@ export function clearStrategicCache(): void {
   inflight.clear();
 }
 
-const cacheKey = (i: StrategicInput) => `${i.routeRef.id}|${i.routeVersion}|${i.contextVersion}`;
+// contextVersion is a content hash, so a context can return to an earlier value far along the trip;
+// the coarse lead bucket (plus the drift check on hits) keeps such a request from reusing an old plan.
+const cacheKey = (i: StrategicInput) => `${i.routeRef.id}|${i.routeVersion}|${i.contextVersion}|${Math.floor(i.leadKm / LEAD_BUCKET_KM)}`;
+const isNearby = (hit: CacheEntry, i: StrategicInput) =>
+  Math.abs(hit.leadKm - i.leadKm) <= REUSE_MAX_KM && Math.abs(hit.elapsed - i.elapsedMinutes) <= REUSE_MAX_MINUTES;
 
 /* ------------------------------------------------------------------ planner */
 
@@ -491,7 +509,7 @@ export async function runStrategicPlanner(input: StrategicInput, deps: Strategic
   const started = Date.now();
   if (!deps.noCache) {
     const hit = cache.get(key);
-    if (hit && Date.now() - hit.at < hit.ttl) {
+    if (hit && Date.now() - hit.at < hit.ttl && isNearby(hit, input)) {
       return { plan: hit.res.plan, meta: { ...hit.res.meta, status: "cached", ms: Date.now() - started } };
     }
     if (hit) cache.delete(key);
@@ -507,7 +525,7 @@ export async function runStrategicPlanner(input: StrategicInput, deps: Strategic
     const res = await p;
     if (!deps.noCache && res.meta.status !== "error") {
       const durable = res.meta.status === "completed" || (res.meta.status === "fallback" && res.meta.muse?.error?.startsWith("disabled"));
-      cache.set(key, { at: Date.now(), ttl: durable ? CACHE_TTL_MS : SHORT_TTL_MS, res });
+      cache.set(key, { at: Date.now(), ttl: durable ? CACHE_TTL_MS : SHORT_TTL_MS, res, leadKm: input.leadKm, elapsed: input.elapsedMinutes });
       while (cache.size > 200) cache.delete(cache.keys().next().value as string);
     }
     return res;
@@ -527,7 +545,8 @@ async function plan(input: StrategicInput, deps: StrategicDeps): Promise<Strateg
     else {
       const t0 = Date.now();
       route = await Promise.race([
-        routeModelForRef(input.routeRef, input.sessionId),
+        // Store miss: geometry first, then wait (bounded) for exits so the plan can name real exits.
+        routeModelForRef(input.routeRef, input.sessionId, { exits: "defer", exitsWaitMs: 8_000 }),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("route lookup timed out")), 12_000))
       ]);
       trace.push({ tool: "route.lookup", input: input.routeRef.id, output: `${r0(route.totalKm)} km (${route.source})`, provenance: "cached", ms: Date.now() - t0 });

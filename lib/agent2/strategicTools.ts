@@ -70,7 +70,8 @@ export interface FutureWindowsData {
 
 export interface PlacesData {
   searched: KmWindow[];
-  perWindow: Array<{ windowId: string; fromKm: number; toKm: number; counts: Record<Need, number> }>;
+  /** coverage: fraction (0–1) of the window covered by searched place tiles. */
+  perWindow: Array<{ windowId: string; fromKm: number; toKm: number; counts: Record<Need, number>; coverage: number }>;
   gaps: Array<{ fromKm: number; toKm: number; lengthKm: number }>;
   candidates: CompactPlace[];
 }

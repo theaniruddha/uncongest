@@ -18,6 +18,8 @@ const UA = "uncongest-sim/0.2 (road-trip simulator)";
 const TTL_MS = 24 * 60 * 60 * 1000;
 /** Routes whose exits are degraded (OSRM ramp steps / none) are retried after 10 min. */
 const DEGRADED_TTL_MS = 10 * 60 * 1000;
+/** Runtime disk-cache files older than this are ignored (re-resolved). Committed recordings never expire. */
+const ROUTE_DISK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const OSRM_TIMEOUT_MS = 20000;
 const MAX_POINTS = 4000;
 const SIMPLIFY_TOLERANCE_KM = 0.03;
@@ -412,12 +414,24 @@ function rememberGeometry(id: string, full: LngLat[], osrm: OsrmRoute): void {
 
 function freshCached(id: string): TripRoute | null {
   const hit = routeCache.get(id);
-  return hit && Date.now() - hit.at < hit.ttl ? hit.route : null;
+  if (!hit) return null;
+  if (Date.now() - hit.at >= hit.ttl) {
+    routeCache.delete(id);
+    return null;
+  }
+  return hit.route;
 }
 
-function cacheRoute(route: TripRoute): void {
-  const ttl = route.exitsStatus === "degraded" ? DEGRADED_TTL_MS : TTL_MS;
+/** Memory-cache a route (LRU-bounded like the store). `ttlMs` overrides the status-based TTL. */
+function cacheRoute(route: TripRoute, ttlMs?: number): void {
+  const ttl = ttlMs ?? (route.exitsStatus === "degraded" ? DEGRADED_TTL_MS : TTL_MS);
+  routeCache.delete(route.id);
   routeCache.set(route.id, { at: Date.now(), ttl, route });
+  while (routeCache.size > STORE_MAX) {
+    const oldest = routeCache.keys().next().value;
+    if (oldest === undefined) break;
+    routeCache.delete(oldest);
+  }
   storeRoute(route);
 }
 
@@ -543,7 +557,12 @@ async function computeExits(base: TripRoute, opts: ResolveOpts): Promise<TripRou
   }
   let exits = elements ? exitsFromJunctions(full, elements, base.distanceKm) : [];
   let borderCrossings = elements ? borderCrossingsFrom(full, elements, base.distanceKm) : [];
-  if (borderCrossings.length === 0) borderCrossings = await countryChangeCrossing(base, opts);
+  let borderLookupFailed = false;
+  if (borderCrossings.length === 0) {
+    const lookup = await countryChangeLookup(base, opts);
+    borderCrossings = lookup.crossings;
+    borderLookupFailed = !lookup.ok;
+  }
   let exitSource = "Overpass motorway_junction";
   const degraded = exits.length === 0;
   if (degraded) {
@@ -557,8 +576,10 @@ async function computeExits(base: TripRoute, opts: ResolveOpts): Promise<TripRou
     exitsStatus: degraded ? "degraded" : "ready",
     attribution: `${OSM_ATTRIBUTION}. Geometry: OSRM demo server; exits: ${exitSource}.`
   });
-  cacheRoute(route);
-  if (!degraded) await persistRoute(route);
+  // A failed border lookup is indistinguishable from "no border" in the route itself, so such a
+  // route is kept in memory only, with the short TTL, and retried later instead of persisted.
+  cacheRoute(route, borderLookupFailed ? DEGRADED_TTL_MS : undefined);
+  if (!degraded && !borderLookupFailed) await persistRoute(route);
   console.info(`[routing] ${base.id} exits ${Date.now() - t0}ms (${route.exitsStatus}, ${exits.length} exits, ${borderCrossings.length} border crossings)`);
   return route;
 }
@@ -631,7 +652,8 @@ export async function resolveRoute(origin: PlaceRef, destination: PlaceRef, opts
 
   // b2. runtime disk cache, then committed recordings (always exitsStatus ready)
   const disk = await readRouteFile(path.join(routeCacheDir(), `${safeId(id)}.json`));
-  if (disk && disk.exitsStatus === "ready") {
+  const diskFresh = disk ? Date.now() - Date.parse(disk.fetchedAt) <= ROUTE_DISK_TTL_MS : false;
+  if (disk && disk.exitsStatus === "ready" && diskFresh) {
     cacheRoute(disk);
     return asCached(disk);
   }
@@ -640,6 +662,24 @@ export async function resolveRoute(origin: PlaceRef, destination: PlaceRef, opts
     const withSuffix = { ...recorded, attribution: `${recorded.attribution} · recorded ${recorded.fetchedAt.slice(0, 10)}` };
     cacheRoute(withSuffix);
     return asCached(withSuffix);
+  }
+
+  // b3. expired entry (degraded / unverified borders) whose full geometry is still in memory:
+  // only the exits need retrying, so skip OSRM and recompute exits from the remembered geometry.
+  const stored = getStoredRoute(id);
+  if (stored && stored.exitsStatus !== "pending" && geometryById.has(id) && !geometryInflight.has(id)) {
+    const pending = tripRouteSchema.parse({
+      ...stored,
+      exits: [],
+      borderCrossings: [],
+      exitsStatus: "pending",
+      source: "osrm",
+      attribution: `${OSM_ATTRIBUTION}. Geometry: OSRM demo server; exits: pending.`
+    });
+    cacheRoute(pending);
+    if (mode === "defer") return asCached(pending);
+    const ready = await resolveExits(id, { sessionId: opts.sessionId, fetchImpl: opts.fetchImpl });
+    return { ...ready, origin, destination, source: "cache" };
   }
 
   // c. OSRM geometry (deduped per id)
@@ -677,14 +717,26 @@ export async function countryChangeCrossing(
   base: TripRoute,
   opts: { sessionId?: string; fetchImpl?: typeof fetch } = {}
 ): Promise<TripRoute["borderCrossings"]> {
-  if (process.env.BORDER_LOOKUP === "0") return [];
+  return (await countryChangeLookup(base, opts)).crossings;
+}
+
+/**
+ * Same as countryChangeCrossing, but reports whether the answer is trustworthy: `ok: false` when a
+ * lookup failed (budget, 429, timeout) or an endpoint country is unknown, so "[]" may be wrong.
+ */
+export async function countryChangeLookup(
+  base: TripRoute,
+  opts: { sessionId?: string; fetchImpl?: typeof fetch } = {}
+): Promise<{ crossings: TripRoute["borderCrossings"]; ok: boolean }> {
+  if (process.env.BORDER_LOOKUP === "0") return { crossings: [], ok: true };
   try {
     const { countryAt } = await import("./geocode");
     const model = routeModelFor(base);
     const a = model.pointAtKm(0);
     const b = model.pointAtKm(model.totalKm);
     const [ca, cb] = await Promise.all([countryAt(a.lat, a.lng, opts), countryAt(b.lat, b.lng, opts)]);
-    if (!ca || !cb || ca === cb) return [];
+    if (!ca || !cb) return { crossings: [], ok: false };
+    if (ca === cb) return { crossings: [], ok: true };
     let lo = 0;
     let hi = model.totalKm;
     for (let i = 0; i < 10 && hi - lo > 2; i++) {
@@ -696,9 +748,12 @@ export async function countryChangeCrossing(
     }
     const km = (lo + hi) / 2;
     const p = model.pointAtKm(km);
-    return [{ km: Math.round(km * 10) / 10, name: `${ca.toUpperCase()} → ${cb.toUpperCase()} border (located via Nominatim country lookups)`, lat: p.lat, lng: p.lng }];
+    return {
+      crossings: [{ km: Math.round(km * 10) / 10, name: `${ca.toUpperCase()} → ${cb.toUpperCase()} border (located via Nominatim country lookups)`, lat: p.lat, lng: p.lng }],
+      ok: true
+    };
   } catch (err) {
     console.warn(`[routing] border lookup failed: ${(err as Error).message}`);
-    return [];
+    return { crossings: [], ok: false };
   }
 }

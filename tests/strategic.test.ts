@@ -282,6 +282,23 @@ describe("runStrategicPlanner", () => {
     expect(c.plan.contextVersion).toBe("cv-2");
     expect(muse).toHaveBeenCalledTimes(2);
   });
+
+  it("same versions far along the trip → recomputed, not a cached plan from the earlier position", async () => {
+    const muse = okMuse({ summary: "ok", opportunities: [], routeDecisions: [], replanTriggers: [], expiresAtKm: null, uncertainty: null });
+    const deps = { ...baseDeps({ muse }), noCache: false };
+    const a = await runStrategicPlanner({ ...baseInput(), leadKm: 0, elapsedMinutes: 0 }, deps);
+    expect(a.meta.status).toBe("completed");
+    const near = await runStrategicPlanner({ ...baseInput(), leadKm: 2, elapsedMinutes: 2 }, deps);
+    expect(near.meta.status).toBe("cached");
+    const far = await runStrategicPlanner({ ...baseInput(), leadKm: 150, elapsedMinutes: 95 }, deps);
+    expect(far.meta.status).not.toBe("cached");
+    expect(far.plan.createdAtElapsed).toBe(95);
+    // same lead bucket but much later in time (e.g. a long stop) → recomputed too
+    const later = await runStrategicPlanner({ ...baseInput(), leadKm: 150, elapsedMinutes: 140 }, deps);
+    expect(later.meta.status).not.toBe("cached");
+    expect(later.plan.createdAtElapsed).toBe(140);
+    expect(muse).toHaveBeenCalledTimes(3);
+  });
 });
 
 describe("callMuseStructured", () => {

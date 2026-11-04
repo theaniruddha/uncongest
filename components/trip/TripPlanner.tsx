@@ -9,7 +9,8 @@ import Inspector, { type Agent1Trace } from "./Inspector";
 import StrategicPanel from "./StrategicPanel";
 import { useStrategic } from "./useStrategic";
 import { summarize, versionHash, type WorkflowSample } from "@/lib/agent2/metrics";
-import { checkTacticalStaleness } from "@/lib/agent2/staleness";
+import { checkTacticalStaleness, withoutSkipped } from "@/lib/agent2/staleness";
+import { strategicContextVersion, tacticalContextVersion, type VersionInput } from "@/lib/agent2/versions";
 import RoadAhead, { type RoadAheadWaypoint } from "../RoadAhead";
 import { createRouteModel, type RouteModel } from "@/lib/route/model";
 import type { TripRoute, TripSetup, StopPlan } from "@/lib/trip/types";
@@ -124,9 +125,18 @@ export default function TripPlanner() {
   const [tacticalSamples, setTacticalSamples] = useState<WorkflowSample[]>([]);
   const [strategicSamples, setStrategicSamples] = useState<WorkflowSample[]>([]);
   const [staleTactical, setStaleTactical] = useState(0);
-  const [strategicUpdate, setStrategicUpdate] = useState<{ title: string; reason: string } | null>(null);
+  const [strategicUpdate, setStrategicUpdate] = useState<{ title: string; reason: string; toKm: number; contextVersion: string | null } | null>(null);
   const [exitsLoading, setExitsLoading] = useState(false);
   const playingRef = useRef(false);
+  /** Token of the current decision hold; any explicit playback change clears it so it never auto-resumes. */
+  const holdRef = useRef<number | null>(null);
+  /** Bumped on every reset / re-plan: in-flight Tactical results from an older trip are discarded. */
+  const tripGenRef = useRef(0);
+  const [tripGen, setTripGen] = useState(0);
+  /** Bumped on every planRoute: geometry/exits/places replies for an older route are discarded. */
+  const routeGenRef = useRef(0);
+  /** Bumped when the shown Strategic plan expires, so the coarse Strategic version changes once. */
+  const [strategicEpoch, setStrategicEpoch] = useState(0);
   const [usage, setUsage] = useState<NonNullable<EngineResult["usage"]>>([]);
   const [memory, setMemory] = useState<WatchMemory>(EMPTY_MEMORY);
   const memoryRef = useRef<WatchMemory>(EMPTY_MEMORY);
@@ -226,21 +236,48 @@ export default function TripPlanner() {
 
   // ---------------- versions (stale-result detection) ----------------
   const routeVersion = plan ? `${plan.route.id}:${plan.route.exitsStatus ?? "ready"}` : null;
-  const contextVersion = useMemo(() => {
-    if (!plan) return null;
-    return versionHash({
-      route: plan.route.id,
-      dest: plan.setup.destination.label,
-      weather: weatherOverride,
-      cars: plan.setup.cars.map((c) => {
-        const i = intents[c.id];
-        return [c.id, i?.needs.map((n) => n.need).sort(), i?.hungerLevel, i?.restroomUrgent, i?.notHungry, i?.dietary.slice().sort()];
-      }),
-      stops: stops.filter((x) => x.status !== "PROPOSED").map((x) => `${x.stopId}:${x.status === "RESUMED" ? "COMPLETED" : x.status}`)
-    });
-  }, [plan, intents, weatherOverride, stops]);
+  const versionInput: VersionInput | null = useMemo(
+    () =>
+      plan
+        ? {
+            tripGen,
+            routeId: plan.route.id,
+            setup: {
+              destinationLabel: plan.setup.destination.label,
+              departureUtcIso: plan.departureUtc.toISOString(),
+              departureMode: plan.setup.departure.mode,
+              tz: plan.tz,
+              dataMode: plan.setup.dataMode,
+              mood: plan.setup.mood,
+              mealPreference: plan.setup.mealPreference,
+              mealHistory: plan.setup.mealHistory,
+              customMeal: plan.setup.customMeal,
+              cars: tripCars.map((c) => ({ id: c.id, speedKph: c.speedKph, startOffsetMinutes: c.startOffsetMinutes }))
+            },
+            weatherOverride,
+            intents,
+            stops
+          }
+        : null,
+    [plan, tripGen, tripCars, weatherOverride, intents, stops]
+  );
+  /** Fine-grained version for Tactical (5 s): setup, speeds/offsets, intents, stop commitments, skipped stops. */
+  const contextVersion = useMemo(() => (versionInput ? tacticalContextVersion({ ...versionInput, skipped }) : null), [versionInput, skipped]);
+  /** Coarse version for Strategic (30 s): changes on setup/needs/weather, finished stops and plan expiry only. */
+  const strategicVersion = useMemo(() => (versionInput ? strategicContextVersion({ ...versionInput, epoch: strategicEpoch }) : null), [versionInput, strategicEpoch]);
   const contextVersionRef = useRef(contextVersion);
   contextVersionRef.current = contextVersion;
+  const elapsedRef = useRef(elapsed);
+  elapsedRef.current = elapsed;
+  const skippedRef = useRef(skipped);
+  skippedRef.current = skipped;
+  const stopsRef = useRef(stops);
+  stopsRef.current = stops;
+  const cancelHold = () => {
+    if (holdRef.current == null) return;
+    holdRef.current = null;
+    setHeldForDecision(false);
+  };
 
   // ---------------- playback ----------------
   playingRef.current = playing;
@@ -266,6 +303,7 @@ export default function TripPlanner() {
       const p = plans.find((x) => x.stopId === t.stopId);
       pushLog("stop", `${p?.name ?? t.stopId}: ${t.to}`);
       if (t.to === "ARRIVED") {
+        cancelHold();
         setPlaying(false);
         setElapsed(t.atElapsed);
       }
@@ -281,6 +319,16 @@ export default function TripPlanner() {
   };
 
   const resetSim = (s: TripSetup) => {
+    // New trip generation: in-flight Tactical/Strategic work from before is discarded, never resumed.
+    tripGenRef.current += 1;
+    setTripGen(tripGenRef.current);
+    cancelHold();
+    loadingRef.current = false;
+    setLoading(false);
+    setTacticalState({ status: "idle" });
+    setStrategicEpoch(0);
+    setStrategicUpdate(null);
+    strategicResetRef.current();
     setElapsed(0);
     setPlaying(false);
     setOffsets({});
@@ -298,6 +346,7 @@ export default function TripPlanner() {
 
   const planRoute = async () => {
     const clickAt = performance.now();
+    const seq = ++routeGenRef.current;
     setPlanning(true);
     setPlanError(null);
     try {
@@ -308,6 +357,7 @@ export default function TripPlanner() {
         body: JSON.stringify({ origin: setup.origin, destination: setup.destination, sessionId, exits: "defer" })
       });
       const data = await res.json().catch(() => null);
+      if (seq !== routeGenRef.current) return; // a newer Plan click superseded this one
       if (!res.ok) {
         setPlanError({ message: data?.error ?? `Route lookup failed (HTTP ${res.status})`, suggestion: data?.suggestion });
         return;
@@ -333,6 +383,8 @@ export default function TripPlanner() {
       const departLocal = formatInZone(departureUtc, tzone);
       setPlan({ route, model: m, setup, departureUtc, tz: tzone, departLocal });
       resetSim(setup);
+      setDiscovering(false);
+      setExitsLoading(false);
       setLog([]);
       setAgent1([]);
       setSetupOpen(false);
@@ -362,9 +414,10 @@ export default function TripPlanner() {
         void discover(route, ws, setup, m, clickAt);
       }
     } catch (e) {
+      if (seq !== routeGenRef.current) return;
       setPlanError({ message: `Couldn't reach the route service: ${(e as Error).message}`, suggestion: "Try the Toronto → Montréal demo preset" });
     } finally {
-      setPlanning(false);
+      if (seq === routeGenRef.current) setPlanning(false);
     }
   };
 
@@ -376,6 +429,8 @@ export default function TripPlanner() {
 
   /** Exits + border crossings arrive after the map is already usable. */
   const loadExits = async (route: TripRoute, s: TripSetup, clickAt: number) => {
+    const gen = routeGenRef.current;
+    const isOld = () => gen !== routeGenRef.current;
     setExitsLoading(true);
     try {
       const res = await fetch("/api/route/exits", {
@@ -384,6 +439,7 @@ export default function TripPlanner() {
         body: JSON.stringify({ id: route.id, origin: s.origin, destination: s.destination, sessionId })
       });
       const data = await res.json().catch(() => null);
+      if (isOld()) return; // the user planned another route meanwhile
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       const full = data as TripRoute;
       const m = createRouteModel({
@@ -404,9 +460,10 @@ export default function TripPlanner() {
         `Exits ready after ${(exitsMs / 1000).toFixed(1)} s: ${full.exits.length} exits${full.borderCrossings.length ? `, border crossing at km ${Math.round(full.borderCrossings[0].km)}` : ""}${full.exitsStatus === "degraded" ? " (OSM junctions unavailable — OSRM ramp steps)" : ""}.`
       );
     } catch (e) {
+      if (isOld()) return;
       pushLog("error", `Exits unavailable: ${(e as Error).message}. The simulation continues without exit labels.`);
     } finally {
-      setExitsLoading(false);
+      if (!isOld()) setExitsLoading(false);
     }
   };
 
@@ -418,6 +475,8 @@ export default function TripPlanner() {
       return true;
     });
     if (!fresh.length) return;
+    const gen = routeGenRef.current;
+    const isOld = () => gen !== routeGenRef.current;
     setDiscovering(true);
     pushLog("info", `Discovering real places in ${fresh.length} likely stop window(s): ${fresh.map((w) => `km ${Math.round(w.minKm)}–${Math.round(w.maxKm)}${w.reason ? ` (${w.reason})` : ""}`).join(", ")}`);
     try {
@@ -427,6 +486,7 @@ export default function TripPlanner() {
         body: JSON.stringify({ route: routeRef({ route, setup: s }), sessionId, windows: fresh.slice(0, 3).map((w) => ({ minKm: Math.max(0, w.minKm), maxKm: Math.min(m.totalKm, w.maxKm), reason: w.reason })) })
       });
       const data = await res.json().catch(() => null);
+      if (isOld()) return; // places for a previous route never leak into the new one
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
       const found = (data.candidates ?? []) as StopCandidate[];
       setKnownPlaces((prev) => {
@@ -438,9 +498,10 @@ export default function TripPlanner() {
       if (clickAt != null) setTimings((t) => (t.placesMs ? t : { ...t, placesMs: Math.round(performance.now() - clickAt) }));
       pushLog("info", `Found ${found.length} real place(s) from OpenStreetMap${(data.trace ?? []).some((x: string) => x.includes("failed")) ? " (some lookups failed — see inspector)" : ""}.`);
     } catch (e) {
+      if (isOld()) return;
       pushLog("error", `Real-place discovery unavailable: ${(e as Error).message}. Agent 2 will retry selectively when needed.`);
     } finally {
-      setDiscovering(false);
+      if (!isOld()) setDiscovering(false);
     }
   };
 
@@ -456,12 +517,12 @@ export default function TripPlanner() {
 
   // ---------------- Agent 2 · Strategic Planner (background, never blocks) ----------------
   const buildStrategicInput = useCallback(() => {
-    if (!plan || !lead || !routeVersion || !contextVersion) return null;
+    if (!plan || !lead || !routeVersion || !strategicVersion) return null;
     const allNeeds = Object.fromEntries(plan.setup.cars.map((c) => [c.id, (intents[c.id]?.needs ?? []).map((n) => n.need)]));
     return {
       routeRef: routeRef(plan),
       routeVersion,
-      contextVersion,
+      contextVersion: strategicVersion,
       sessionId,
       timeZone: tz,
       departureUtc: plan.departureUtc.toISOString(),
@@ -479,29 +540,59 @@ export default function TripPlanner() {
       drivingMinutesSinceRest: Math.round(lead.drivingMinutesSinceRest),
       dataMode: plan.setup.dataMode
     };
-  }, [plan, lead, routeVersion, contextVersion, intents, sessionId, tz, elapsed, leadCar, nowLocal.time, groupDiet, lastMealMinutesAgo, weatherOverride]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plan, lead, routeVersion, strategicVersion, intents, sessionId, tz, elapsed, leadCar, nowLocal.time, groupDiet, lastMealMinutesAgo, weatherOverride]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const strategic = useStrategic({
     enabled: Boolean(plan) && plan?.setup.dataMode !== "demo",
     routeVersion,
-    contextVersion,
+    contextVersion: strategicVersion,
     buildInput: buildStrategicInput,
-    onResult: (st, accepted) => {
-      if (st.ms != null) setStrategicSamples((x) => [...x.slice(-50), { ms: st.ms!, status: accepted ? st.status : "stale", at: Date.now() }]);
+    // One run per route, not one for the geometry-only stage and another once exits arrive.
+    hold: exitsLoading,
+    leadKm: lead && lead.phase !== "arrived" ? lead.progressKm : null,
+    elapsedMinutes: lead && lead.phase !== "arrived" ? elapsed : null,
+    routeTotalKm: model?.totalKm ?? null,
+    onResult: (st, outcome) => {
+      if (st.ms != null) setStrategicSamples((x) => [...x.slice(-50), { ms: st.ms!, status: outcome === "accepted" ? st.status : outcome, at: Date.now() }]);
       setTimings((t) => (t.firstStrategicMs || t.clickAt == null ? t : { ...t, firstStrategicMs: Math.round(performance.now() - t.clickAt) }));
-      if (!accepted) {
+      if (outcome === "error") {
+        pushLog("error", `Strategic planning failed (${st.error ?? "unknown error"}) — will retry; Tactical still works.`);
+        return;
+      }
+      if (outcome === "stale") {
         pushLog("info", `Strategic result discarded — computed for an older route/context (${st.plan?.contextVersion}); re-planning.`);
         return;
       }
       pushLog("info", `Strategic plan (${st.meta?.status}, ${((st.ms ?? 0) / 1000).toFixed(1)} s): ${st.plan?.summary ?? ""}`);
       // A better future opportunity than the current tactical pick → suggest, never silently replace.
-      const top = st.plan?.opportunities.find((o) => o.priority === "high" && o.candidateIds.length > 0);
+      // Not while a stop is already selected / en route / in progress, and only for opportunities still ahead.
+      if (stopsRef.current.some((x) => (ACTIVE_STATUSES as readonly string[]).includes(x.status))) return;
+      const top = st.plan?.opportunities.find((o) => o.priority === "high" && o.candidateIds.length > 0 && o.toKm >= leadKmRef.current);
       const currentIds = resultRef.current?.recommendations.map((r) => r.stopId) ?? [];
       if (top && resultRef.current && currentIds.length && !top.candidateIds.some((id) => currentIds.includes(id))) {
-        setStrategicUpdate({ title: top.title, reason: `${top.reason} (Tactical currently suggests ${resultRef.current.recommendations[0]?.name ?? "another stop"}.)` });
+        setStrategicUpdate({
+          title: top.title,
+          reason: `${top.reason} (Tactical currently suggests ${resultRef.current.recommendations[0]?.name ?? "another stop"}.)`,
+          toKm: top.toKm,
+          contextVersion: st.contextVersion
+        });
       }
     }
   });
+  const strategicResetRef = useRef(strategic.reset);
+  strategicResetRef.current = strategic.reset;
+  // Plan expired (lead passed expiresAtKm or clock passed expiresAtElapsed) → one coarse version bump → one re-plan.
+  useEffect(() => {
+    if (strategic.expired) {
+      pushLog("info", "Strategic plan expired — re-planning for the road ahead.");
+      setStrategicEpoch((e) => e + 1);
+    }
+  }, [strategic.expired]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The "Strategic update" banner is dropped once it stops being relevant.
+  useEffect(() => {
+    if (!strategicUpdate) return;
+    if (activeStop || strategicUpdate.contextVersion !== strategicVersion || (lead && strategicUpdate.toKm < lead.progressKm)) setStrategicUpdate(null);
+  }, [strategicUpdate, Boolean(activeStop), strategicVersion, Math.floor((lead?.progressKm ?? 0) / 5)]); // eslint-disable-line react-hooks/exhaustive-deps
   const strategicHints = useMemo(() => {
     if (!strategic.isCurrent || !strategic.state.plan || !lead) return [];
     return strategic.state.plan.opportunities
@@ -631,14 +722,19 @@ export default function TripPlanner() {
     async (trigger: "watcher" | "manual", key?: string) => {
       const body = buildRequest();
       if (!body || loadingRef.current) return;
+      const gen = tripGenRef.current;
+      const isOld = () => gen !== tripGenRef.current;
       loadingRef.current = true;
       setLoading(true);
       setLastRequest(body);
       setTacticalState({ status: "running" });
       const t0 = performance.now();
       // Simulated time holds while Uncongest decides, so a slow lookup never lets the car drive past the exit.
-      const wasPlaying = playingRef.current;
-      if (wasPlaying) {
+      // The hold token lets any explicit playback change (pause, scrub, reset, arrival) win over the auto-resume.
+      let holdToken: number | null = null;
+      if (playingRef.current) {
+        holdToken = Date.now() + Math.random();
+        holdRef.current = holdToken;
         setPlaying(false);
         setHeldForDecision(true);
       }
@@ -646,11 +742,30 @@ export default function TripPlanner() {
         memoryRef.current = { ...memoryRef.current, lastKey: key, lastCallElapsed: elapsed };
         setMemory(memoryRef.current);
       }
+      const recordFailure = (detail: string) => {
+        const ms = Math.round(performance.now() - t0);
+        setTacticalSamples((x) => [...x.slice(-100), { ms, status: "error", at: Date.now() }]);
+        setTacticalState({ status: "error", ms, detail });
+      };
+      const discardAsStale = (ms: number, detail: string, logReason: string) => {
+        setStaleTactical((n) => n + 1);
+        setTacticalSamples((x) => [...x.slice(-100), { ms, status: "stale", at: Date.now() }]);
+        setTacticalState({ status: "stale", ms, detail });
+        pushLog("info", `Tactical result discarded as stale (${logReason}) — re-deciding.`);
+        memoryRef.current = { ...memoryRef.current, lastKey: null, lastCallElapsed: null, lastRecommendedKm: null, lastRecommendedStopId: null };
+        setMemory(memoryRef.current);
+      };
       try {
         const res = await fetch("/api/recommend-stops", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
         const data = await res.json().catch(() => null);
+        if (isOld()) {
+          pushLog("info", "Tactical result discarded — the trip was reset or re-planned while deciding.");
+          return;
+        }
         if (!res.ok) {
-          setError(`${data?.error ?? `HTTP ${res.status}`}${data?.issues ? ` — ${data.issues.map((i: { path: string[]; message: string }) => `${i.path.join(".")}: ${i.message}`).join("; ")}` : ""}`);
+          const msg = data?.error ?? `HTTP ${res.status}`;
+          setError(`${msg}${data?.issues ? ` — ${data.issues.map((i: { path: string[]; message: string }) => `${i.path.join(".")}: ${i.message}`).join("; ")}` : ""}`);
+          recordFailure(String(msg));
           pushLog("error", `Agent 2 failed: ${data?.error ?? res.status}`);
           return;
         }
@@ -659,21 +774,24 @@ export default function TripPlanner() {
         const tac = r.tactical;
         if (r.usage?.length) setUsage(r.usage);
         setTimings((t) => (t.firstTacticalMs || t.clickAt == null ? t : { ...t, firstTacticalMs: Math.round(performance.now() - t.clickAt) }));
-        // ---- staleness: context changed, or the car passed the suggested exit while we waited ----
+        // ---- staleness: context changed, time went backwards, or the car passed the suggested exit while we waited ----
         const curLead = leadKmRef.current;
         const noticeKm = (leadCar.speedKph * NOTICE_MIN) / 60;
-        const verdict = checkTacticalStaleness(r, contextVersionRef.current, curLead, noticeKm);
+        const verdict = checkTacticalStaleness(r, contextVersionRef.current, curLead, noticeKm, elapsedRef.current);
         if (verdict.stale) {
-          const contextChanged = verdict.reason === "context_changed";
-          setStaleTactical((n) => n + 1);
-          setTacticalSamples((x) => [...x.slice(-100), { ms: clientMs, status: "stale", at: Date.now() }]);
-          setTacticalState({ status: "stale", ms: clientMs, detail: contextChanged ? "situation changed while deciding" : "the car passed the suggested exit" });
-          pushLog("info", `Tactical result discarded as stale (${contextChanged ? "context changed" : "exit no longer reachable with notice"}) — re-deciding.`);
-          memoryRef.current = { ...memoryRef.current, lastKey: null, lastCallElapsed: null, lastRecommendedKm: null, lastRecommendedStopId: null };
-          setMemory(memoryRef.current);
+          const why = verdict.reason === "context_changed" ? "situation changed while deciding" : verdict.reason === "time_reversed" ? "the trip was reset or rewound while deciding" : "the car passed the suggested exit";
+          const logWhy = verdict.reason === "context_changed" ? "context changed" : verdict.reason === "time_reversed" ? "decided for a later point of the trip" : "exit no longer reachable with notice";
+          discardAsStale(clientMs, why, logWhy);
           return;
         }
         if (verdict.dropped.length) r.recommendations = r.recommendations.filter((x) => verdict.keepStopIds.includes(x.stopId)).map((x, i) => ({ ...x, rank: i + 1 }));
+        // Stops skipped while the request was in flight never come back.
+        const hadRecs = r.recommendations.length > 0;
+        r.recommendations = withoutSkipped(r.recommendations, skippedRef.current);
+        if (hadRecs && r.recommendations.length === 0) {
+          discardAsStale(clientMs, "every suggested stop was skipped while deciding", "suggested stops were skipped");
+          return;
+        }
         setError(null);
         setResult(r);
         const status = tac?.status === "muse" ? "muse" : tac?.status === "timeout" ? "timeout" : tac ? "fallback" : "fallback";
@@ -685,9 +803,10 @@ export default function TripPlanner() {
           void discover(plan.route, [{ minKm: from, maxKm: Math.min(model.totalKm, from + 60), reason: "Tactical asked to search farther" }], plan.setup, model);
         }
         if (r.recommendedStops?.length) {
+          const skippedNow = new Set(skippedRef.current);
           setKnownPlaces((prev) => {
             const ids = new Set(prev.map((p) => p.id));
-            return [...prev, ...r.recommendedStops!.filter((s) => !ids.has(s.id))].sort((a, b) => a.distanceAlongRouteKm - b.distanceAlongRouteKm);
+            return [...prev, ...r.recommendedStops!.filter((s) => !ids.has(s.id) && !skippedNow.has(s.id))].sort((a, b) => a.distanceAlongRouteKm - b.distanceAlongRouteKm);
           });
         }
         const top = r.recommendations[0];
@@ -703,12 +822,17 @@ export default function TripPlanner() {
             : `Agent 2 (${r.provider}) → ${r.recommendations.map((x) => `#${x.rank} ${x.name}`).join(", ")} [${r.urgency?.level} urgency, ${trigger}]`
         );
       } catch (e) {
+        if (isOld()) return;
         setError(`network error: ${(e as Error).message}`);
-        setTacticalState({ status: "error", detail: (e as Error).message });
+        recordFailure((e as Error).message);
       } finally {
-        loadingRef.current = false;
-        setLoading(false);
-        if (wasPlaying) {
+        if (!isOld()) {
+          loadingRef.current = false;
+          setLoading(false);
+        }
+        // Resume only if this decision's hold is still the active one (no pause/scrub/reset/arrival meanwhile).
+        if (holdToken != null && holdRef.current === holdToken) {
+          holdRef.current = null;
           setHeldForDecision(false);
           setPlaying(true);
         }
@@ -939,8 +1063,17 @@ export default function TripPlanner() {
       <section className="min-w-0 space-y-3">
         <div className="rounded-xl border border-slate-200 bg-white p-3">
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={() => setPlaying((p) => !p)} disabled={!plan} className="focus-ring rounded-md bg-navy px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-40">
-              {playing ? "Pause" : "Play"}
+            <button
+              type="button"
+              onClick={() => {
+                cancelHold();
+                setPlaying((p) => !p);
+              }}
+              disabled={!plan || heldForDecision}
+              title={heldForDecision ? "Simulated time is paused while Agent 2 decides; it resumes automatically." : undefined}
+              className="focus-ring rounded-md bg-navy px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-40"
+            >
+              {heldForDecision ? "Deciding…" : playing ? "Pause" : "Play"}
             </button>
             <button type="button" onClick={() => plan && resetSim(plan.setup)} disabled={!plan} className="focus-ring rounded-md border border-slate-300 px-3 py-1.5 text-sm disabled:opacity-40">
               Reset
@@ -992,6 +1125,7 @@ export default function TripPlanner() {
               step={1}
               value={Math.floor(elapsed)}
               onChange={(e) => {
+                cancelHold();
                 setPlaying(false);
                 setElapsed(Number(e.target.value));
               }}
@@ -1138,7 +1272,10 @@ export default function TripPlanner() {
             elapsed={elapsed}
             minutesToStop={timelineArrival(activeStop) - elapsed}
             arrivalLocal={eta?.arrivalLocal ?? "—"}
-            onGo={() => setPlaying(true)}
+            onGo={() => {
+              cancelHold();
+              setPlaying(true);
+            }}
             onJump={() => setElapsed(Math.min(timelineArrival(activeStop), maxElapsed))}
             onSpend={() => setElapsed((activeStop.arrivedAtElapsed ?? elapsed) + activeStop.plannedDwellMinutes)}
             onDwell={(m) => dispatchStop({ type: "setDwell", stopId: activeStop.stopId, minutes: m })}
@@ -1159,7 +1296,10 @@ export default function TripPlanner() {
             onDwell={() => undefined}
             onComplete={() => undefined}
             onResume={() => {
-              if (dispatchStop({ type: "resume", stopId: lastCompleted.stopId, elapsed }, `Resumed driving from ${lastCompleted.name}`)) setPlaying(true);
+              if (dispatchStop({ type: "resume", stopId: lastCompleted.stopId, elapsed }, `Resumed driving from ${lastCompleted.name}`)) {
+                cancelHold();
+                setPlaying(true);
+              }
             }}
             onCancel={() => undefined}
           />
@@ -1230,11 +1370,13 @@ export default function TripPlanner() {
           <StrategicPanel
             state={strategic.state}
             isCurrent={strategic.isCurrent}
+            expired={strategic.expired}
             leadKm={lead?.progressKm ?? 0}
             placeName={(id) => knownPlaces.find((p) => p.id === id)?.name ?? null}
             update={strategicUpdate}
             onAskTactical={() => {
               setStrategicUpdate(null);
+              if (activeStop) return; // never re-decide in the middle of a detour
               memoryRef.current = { ...memoryRef.current, lastKey: null, lastCallElapsed: null };
               setMemory(memoryRef.current);
               void runRef.current("manual");

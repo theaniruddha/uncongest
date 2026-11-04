@@ -101,16 +101,24 @@ export async function overpassQuery(
   const pending = inflight.get(opts.cacheKey);
   // Cache-only callers never wait on an in-flight live query (that is what makes them fast).
   if (pending && !opts.cacheOnly) return pending;
-  const disk = await readDisk(opts.cacheKey, ttl);
-  if (disk) {
+  const fromDisk = (disk: { entry: DiskEntry; recorded: boolean }): OverpassResult => {
     cache.set(opts.cacheKey, { at: disk.entry.at, elements: disk.entry.elements });
     budget.hit();
     return { elements: disk.entry.elements, provenance: "cached", fetchedAt: new Date(disk.entry.at).toISOString(), recorded: disk.recorded };
+  };
+  // Start the disk read now but do not await it before registering the in-flight entry: an await
+  // here would let a concurrent identical query slip past the dedup check above.
+  const diskRead = readDisk(opts.cacheKey, ttl);
+
+  if (opts.cacheOnly) {
+    const disk = await diskRead;
+    if (disk) return fromDisk(disk);
+    throw new OverpassUnavailableError("not cached");
   }
 
-  if (opts.cacheOnly) throw new OverpassUnavailableError("not cached");
-
   const run = (async (): Promise<OverpassResult> => {
+    const disk = await diskRead;
+    if (disk) return fromDisk(disk);
     const refused = budget.take(opts.sessionId);
     if (refused) throw new OverpassUnavailableError(refused);
     const f = opts.fetchImpl ?? fetch;
@@ -146,7 +154,8 @@ export async function overpassQuery(
   try {
     return await run;
   } finally {
-    inflight.delete(opts.cacheKey);
+    // Only remove our own registration (a later run may have replaced it).
+    if (inflight.get(opts.cacheKey) === run) inflight.delete(opts.cacheKey);
   }
 }
 

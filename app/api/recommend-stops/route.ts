@@ -4,7 +4,7 @@ import { decideWithExploration, urgencyForRequest } from "@/lib/domain/engine";
 import type { EligibleStop, RecommendStopsRequest, RejectionReason, StopCandidate, ToolTraceEntry, WeatherSnapshot } from "@/lib/domain/types";
 import { HORIZON, type UrgencyResult } from "@/lib/domain/urgency";
 import { getAiProvider } from "@/lib/providers/ai";
-import { runTactical, type TacticalDecision, type TacticalMeta } from "@/lib/agent2/tactical";
+import { reconcileTactical, runTactical, type TacticalDecision, type TacticalMeta } from "@/lib/agent2/tactical";
 import { allUsage, getBudget } from "@/lib/providers/budget";
 import { getPlaceProvider, type PlaceProvider } from "@/lib/providers/places";
 import { routeModelForRef } from "@/lib/providers/routeRef";
@@ -16,9 +16,20 @@ import { TORONTO_MONTREAL } from "@/lib/route/route";
 export const dynamic = "force-dynamic";
 
 /** Resolve `p` or give up after `ms` (returns `fallback`). Used to keep the Tactical path inside its budget. */
-function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
+function within<T>(p: Promise<T>, ms: number, fallback: T | (() => T | Promise<T>)): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<T>((r) => {
+    timer = setTimeout(() => r(typeof fallback === "function" ? (fallback as () => T | Promise<T>)() : fallback), Math.max(0, ms));
+  });
+  // A late rejection must not become an unhandled rejection once the fallback has won.
+  p.catch(() => undefined);
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
 }
+
+/** Whole Tactical request budget (car weather + route + candidates + Muse). */
+const CAR_WEATHER_CAP_MS = 1500;
+const STOP_WEATHER_CAP_MS = 1500;
+const MIN_MUSE_MS = 1500;
 
 function snap(r: WeatherReading): WeatherSnapshot {
   const { id, condition, tempC, precipProbability, description, source, forHour, stale, note } = r;
@@ -54,6 +65,8 @@ export async function POST(req: Request) {
 
   // ---- Context layer: route, positions + weather at each car now ----
   const startedAt = Date.now();
+  const deadlineAt = startedAt + Number(process.env.TACTICAL_DEADLINE_MS ?? 5000);
+  const remaining = () => deadlineAt - Date.now();
   const ctx = request.context;
   const tripCtx = ctx;
   const tactical = ctx?.workflow === "tactical";
@@ -81,7 +94,18 @@ export async function POST(req: Request) {
     await timed(
       "weather.cars",
       `${cars.length} car(s) @ ${nowLocal}`,
-      () => weather.getReadings(cars.map((c) => ({ id: c.id, lat: c.lat!, lng: c.lng!, localDateTime: nowLocal })), request.environment.weather),
+      () => {
+        const pts = cars.map((c) => ({ id: c.id, lat: c.lat!, lng: c.lng!, localDateTime: nowLocal }));
+        const readings = weather.getReadings(pts, request.environment.weather);
+        if (!tactical || weatherMode !== "live") return readings;
+        // Tactical: never let a slow weather service eat the decision budget; the fetch still fills the cache.
+        return within(readings, CAR_WEATHER_CAP_MS, async () =>
+          (await getWeatherProvider("simulated", timeZone).getReadings(pts, request.environment.weather)).map((r) => ({
+            ...r,
+            note: "live weather timed out; using simulated"
+          }))
+        );
+      },
       (r) => r.map((w) => `${w.id}: ${w.description}${w.tempC != null ? ` ${Math.round(w.tempC)}°C` : ""} [${w.source}]`).join("; "),
       weatherMode === "live" ? "live" : "simulated"
     )
@@ -160,7 +184,9 @@ export async function POST(req: Request) {
     exploration: string[];
   }) => {
     eligibleSeen = ctx.eligible;
-    stopWeather = tactical ? await within(stopWeatherFor(ctx.eligible), 1500, {}) : await stopWeatherFor(ctx.eligible);
+    stopWeather = tactical
+      ? await within(stopWeatherFor(ctx.eligible), Math.min(STOP_WEATHER_CAP_MS, remaining() - MIN_MUSE_MS), {})
+      : await stopWeatherFor(ctx.eligible);
     if (tactical) {
       const t = await runTactical({
         trip: enriched.trip,
@@ -178,7 +204,7 @@ export async function POST(req: Request) {
         tripContext: tripCtx?.agentContext,
         preferences: tripCtx ? { mood: tripCtx.mood, mealPreference: tripCtx.mealPreference, customMeal: tripCtx.customMeal } : undefined,
         strategicHints: tripCtx?.strategicHints ?? []
-      });
+      }, { deadlineMs: Math.max(MIN_MUSE_MS, remaining()) });
       tacticalMeta = t.meta;
       tacticalDecision = t.decision;
       trace.push({
@@ -231,9 +257,16 @@ export async function POST(req: Request) {
   if (realPlaces) for (const line of realPlaces.trace) trace.push({ tool: "places.osm.detail", input: "", output: line });
   const recommended = result.recommendations.map((r) => r.stopId);
   const stops = recommended.map((id) => stopWeather[id]).filter((w): w is WeatherSnapshot => Boolean(w));
+  // Only report "muse" when the engine actually acted on Muse's decision.
+  const td = tacticalDecision as TacticalDecision | null;
+  const recon = td ? reconcileTactical(td, result) : null;
+  const museOverridden = Boolean(td && recon?.overridden);
+  if (td && museOverridden) providerNote.value = `deterministic (engine override of Muse ${td.decision})`;
   return NextResponse.json({
     ...result,
     provider: providerNote.value,
+    // A Muse headline the engine did not act on was never validated → never speak it.
+    speakMessage: museOverridden ? undefined : result.speakMessage,
     exploration: [...contextNotes, ...result.exploration],
     weather: { mode: weatherMode, cars: carWeather, stops },
     recommendedStops: recommended.map((id) => eligibleSeen.find((e) => e.stop.id === id)?.stop).filter(Boolean),
@@ -242,15 +275,32 @@ export async function POST(req: Request) {
     dataMode: ctx?.dataMode ?? "demo",
     tactical: tactical
       ? (() => {
-          const meta = (tacticalMeta as TacticalMeta | null) ?? { status: "fallback" as const, provider: "deterministic", ms: 0, detail: "no validated candidates" };
-          const dec = (tacticalDecision as TacticalDecision | null)?.decision;
+          const noTrigger = result.triggerReasons.length === 0;
+          const meta = (tacticalMeta as TacticalMeta | null) ?? {
+            status: "fallback" as const,
+            provider: "deterministic",
+            ms: 0,
+            detail: noTrigger ? "no active need — nothing to decide" : "no validated candidates"
+          };
           // Real needs but nothing reachable/known yet → say so (and let the client search farther), never "stay quiet".
-          const noCandidates = eligibleSeen.length === 0 && result.triggerReasons.length > 0 && (result.urgency?.level ?? "none") !== "none";
+          const noCandidates = eligibleSeen.length === 0 && !noTrigger && (result.urgency?.level ?? "none") !== "none";
+          if (td && recon?.overridden) {
+            return {
+              ...meta,
+              status: "overridden" as const,
+              provider: `deterministic (engine override of Muse ${td.decision})`,
+              decision: recon.decision,
+              museDecision: td.decision,
+              detail: recon.detail,
+              headline: undefined,
+              totalMs: Date.now() - startedAt
+            };
+          }
           return {
             ...meta,
-            decision: dec ?? (noCandidates ? "SEARCH_FARTHER" : undefined),
+            decision: td?.decision ?? (noCandidates ? "SEARCH_FARTHER" : undefined),
             detail: noCandidates ? "no suitable place known within reach yet — searching farther" : meta.detail,
-            headline: (tacticalDecision as TacticalDecision | null)?.headline,
+            headline: td?.headline,
             totalMs: Date.now() - startedAt
           };
         })()

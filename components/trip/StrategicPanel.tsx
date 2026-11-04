@@ -17,6 +17,7 @@ const STATUS_STYLE: Record<string, string> = {
 export default function StrategicPanel({
   state,
   isCurrent,
+  expired = false,
   leadKm,
   placeName,
   update,
@@ -25,6 +26,8 @@ export default function StrategicPanel({
 }: {
   state: StrategicState;
   isCurrent: boolean;
+  /** The plan matches the current versions but the lead passed its expiry km/time. */
+  expired?: boolean;
   leadKm: number;
   placeName: (id: string) => string | null;
   update: { title: string; reason: string } | null;
@@ -61,7 +64,11 @@ export default function StrategicPanel({
       )}
       {plan && (
         <div className={isCurrent ? "" : "opacity-60"}>
-          {!isCurrent && <p className="mt-1 text-[11px] text-amber">Plan is from before the latest change — re-planning.</p>}
+          {!isCurrent && (
+            <p className="mt-1 text-[11px] text-amber">
+              {expired ? "Plan expired — re-planning for the road ahead." : state.status === "error" ? "Showing the last good plan — it predates the latest change; retrying." : "Plan is from before the latest change — re-planning."}
+            </p>
+          )}
           <p className="mt-1 text-xs text-slate-700">{plan.summary}</p>
           <ul className="mt-2 space-y-1.5">
             {ahead.slice(0, 5).map((o) => (

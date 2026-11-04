@@ -90,6 +90,9 @@ export function dietFit(stop: StopCandidate, diet: Dietary[], needs: Need[]): Di
   if (veg.length === 0) return { ok: true, adjust: 0 };
   // Evidence first (verified / possible / unsuitable / unknown); unknown falls back to the menu heuristic.
   const vegan = veg.includes("vegan");
+  // Not vegetarian-suitable implies not vegan-suitable either — check that before the vegan evidence.
+  const vegEv = stop.evidence?.vegetarian;
+  if (vegEv?.level === "unsuitable") return { ok: false, reason: `not vegetarian-suitable (${vegEv.source})`, adjust: 0 };
   const ev = stop.evidence?.[vegan ? "vegan" : "vegetarian"];
   if (ev?.level === "unsuitable") return { ok: false, reason: `not ${vegan ? "vegan" : "vegetarian"}-suitable (${ev.source})`, adjust: 0 };
   if (ev?.level === "verified") return { ok: true, adjust: 0.06, note: `${vegan ? "vegan" : "vegetarian"} options verified (${ev.source})` };
@@ -136,13 +139,24 @@ export function evaluateCandidates(
   intent: CollectiveIntent,
   config: TripConfig,
   trip: TripContext,
-  env: Environment
+  env: Environment,
+  /**
+   * Needs in `intent.need` that were only inferred (e.g. a meal-time reminder), not asked for.
+   * They may shape scoring but never trigger strict diet rejection, the multi-need weight or bypass the quiet window.
+   */
+  inferredNeeds: Need[] = []
 ): { eligible: EligibleStop[]; rejected: RejectionReason[] } {
   const lead = cars.find((c) => c.role === "lead") ?? cars[0];
-  const allNeeds = new Set<Need>([...intent.need, ...cars.flatMap((c) => c.needs)]);
+  const carNeeds = cars.flatMap((c) => c.needs);
+  const inferred = new Set<Need>(inferredNeeds.filter((n) => !carNeeds.includes(n) && !(n === "meal" && intent.hungerLevel >= 2)));
+  const explicitIntentNeeds = intent.need.filter((n) => !inferred.has(n));
+  const allNeeds = new Set<Need>([...explicitIntentNeeds, ...carNeeds]);
+  if (intent.hungerLevel >= 3) allNeeds.add("meal");
   const requiredDiet = [...new Set([...config.requiredDiet, ...intent.dietary])];
   const urgent = intent.hungerLevel >= 3 || intent.need.includes("ev_charge");
-  const urgentNeeds: Need[] = intent.hungerLevel >= 3 ? [...allNeeds, "meal" as Need] : [...allNeeds];
+  // With no explicit need at all (reminder-only call), the inferred needs ARE the purpose of the stop.
+  const urgentNeeds: Need[] = allNeeds.size > 0 ? [...allNeeds] : [...inferred];
+  const softNeeds: Need[] = allNeeds.size > 0 ? [...inferred].filter((n) => !allNeeds.has(n)) : [];
 
   const eligible: EligibleStop[] = [];
   const rejected: RejectionReason[] = [];
@@ -166,7 +180,7 @@ export function evaluateCandidates(
       }
     }
     // Early-trip quiet window: only routine/inferred stops are held; explicit or urgent requests always pass.
-    const explicitOrUrgent = intent.need.length > 0 || intent.hungerLevel >= 2 || intent.restroomUrgent === true || trip.overrideInitialQuiet === true;
+    const explicitOrUrgent = explicitIntentNeeds.length > 0 || intent.hungerLevel >= 2 || intent.restroomUrgent === true || trip.overrideInitialQuiet === true;
     if (trip.elapsedMinutes < config.noOptionalStopsFirstMinutes && !explicitOrUrgent) {
       reasons.push(`within no-optional-stops window (first ${config.noOptionalStopsFirstMinutes} min)`);
     }
@@ -209,6 +223,9 @@ export function evaluateCandidates(
 
     const diet = dietFit(stop, requiredDiet, urgentNeeds);
     if (!diet.ok) reasons.push(diet.reason!);
+    // An inferred meal never hard-rejects a stop the group only needs for something else.
+    const inferredDiet = softNeeds.length ? dietFit(stop, requiredDiet, [...urgentNeeds, ...softNeeds]) : { ok: true, adjust: 0 };
+    if (diet.ok && !inferredDiet.ok) soft.push(`${inferredDiet.reason} — fine for ${urgentNeeds.join(", ")}; not recommended for a meal`);
     if (urgentNeeds.includes("ev_charge") && !chargerCompatible(stop, cars)) {
       reasons.push("no verified compatible charger for an EV in the group");
     }
@@ -226,6 +243,8 @@ export function evaluateCandidates(
     const maxDetourNorm = Math.min(maxDetour / Math.max(config.maximumDetourMinutesPerCar, 1), 1);
     const waitNorm = Math.min(maxGroupWait / Math.max(config.maximumRegroupWaitMinutes, 1), 1);
     const unmetNorm = urgentNeeds.length > 0 ? unmet.length / urgentNeeds.length : 0;
+    // Small bonus for also covering an inferred need (e.g. lunch-time reminder) — never more.
+    const softBonus = softNeeds.length && softNeeds.some((n) => stop.categories.includes(n)) && inferredDiet.ok ? 0.05 : 0;
 
     const fatigue = trip.minutesSinceLastStop != null ? Math.min(trip.minutesSinceLastStop / 180, 1) : 0;
     const darkness = env.daylightMinutes < 60 ? (60 - env.daylightMinutes) / 60 : 0;
@@ -243,7 +262,9 @@ export function evaluateCandidates(
         0.05 * darkness * maxDetourNorm +
         trafficRisk) +
       kidFactor +
-      diet.adjust;
+      softBonus +
+      diet.adjust -
+      (inferredDiet.ok ? 0 : 0.03);
     if (diet.note && diet.adjust < 0) soft.push(diet.note);
 
     const tier: EligibleStop["tier"] =
@@ -483,7 +504,8 @@ export async function exploreNextExits(
   request: import("./types").RecommendStopsRequest,
   initial: { eligible: EligibleStop[]; rejected: RejectionReason[] },
   allInitialStops: StopCandidate[],
-  placeProvider: PlaceProvider
+  placeProvider: PlaceProvider,
+  inferredNeeds: Need[] = []
 ): Promise<ExplorationOutcome> {
   const { cars, collectiveIntent } = request;
   const lead = cars.find((c) => c.role === "lead") ?? cars[0];
@@ -509,7 +531,8 @@ export async function exploreNextExits(
     collectiveIntent,
     request.config,
     request.trip,
-    request.environment
+    request.environment,
+    inferredNeeds
   );
   const discoveredStopIds = newEligible.map((e) => e.stop.id);
   if (newEligible.length > 0) {
@@ -666,6 +689,8 @@ export async function decideWithExploration(
   // Inferred needs (e.g. a meal-time reminder) shape scoring, but not the trigger wording.
   const evalIntent = { ...request.collectiveIntent, need: [...new Set([...request.collectiveIntent.need, ...urgency.needs])] };
   const activeNeeds = evalIntent.need;
+  const explicitNeeds = new Set<Need>([...request.collectiveIntent.need, ...request.cars.flatMap((c) => c.needs)]);
+  const inferredNeeds = urgency.needs.filter((n) => !explicitNeeds.has(n));
   const servesNeed = (r: { eligible: EligibleStop[]; rejected: RejectionReason[] }) => {
     if (activeNeeds.length === 0) return r;
     const keep = r.eligible.filter((e) => activeNeeds.some((n) => e.stop.categories.includes(n)));
@@ -674,7 +699,7 @@ export async function decideWithExploration(
       .map((e) => ({ stopId: e.stop.id, reasons: [`doesn't serve any active need (${activeNeeds.join(", ")})`] }));
     return { eligible: keep, rejected: [...r.rejected, ...drop] };
   };
-  const initial = servesNeed(evaluateCandidates(initialStops, request.cars, evalIntent, request.config, request.trip, request.environment));
+  const initial = servesNeed(evaluateCandidates(initialStops, request.cars, evalIntent, request.config, request.trip, request.environment, inferredNeeds));
   const baseTriggers = deriveTriggerReasons(request.collectiveIntent, request.config, request.trip, request.environment);
   const triggers = [...baseTriggers];
   if (urgency.level !== "none" && baseTriggers.length === 0) triggers.push(...urgency.reasons);
@@ -695,7 +720,7 @@ export async function decideWithExploration(
         discovered = found;
         return found;
       }
-    });
+    }, inferredNeeds);
     const filtered = servesNeed({ eligible: outcome.eligible, rejected: outcome.rejected });
     exploration = outcome.exploration;
     eligible = filtered.eligible;
@@ -715,7 +740,8 @@ export async function decideWithExploration(
   }
 
   let llmPick = null;
-  if (llmResolver && (triggers.length === 0 || eligible.length > 0)) {
+  // No trigger → decide() stays silent regardless, so never pay for a model call.
+  if (llmResolver && triggers.length > 0 && eligible.length > 0) {
     try {
       llmPick = await llmResolver({ eligible, rejected, triggerReasons: triggers, urgency, exploration });
     } catch {
