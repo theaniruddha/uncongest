@@ -22,7 +22,7 @@ test("demo preset: watcher → recommendation → select 30-min meal → arrive 
   await openTrip(page);
   await page.getByRole("button", { name: /Highway 401 demo/i }).click();
   await plan(page);
-  await expect(page.getByTestId("data-badge")).toContainText("DEMO MODE");
+  await expect(page.getByTestId("data-badge")).toContainText("FIXTURE EVIDENCE");
   await expect(page.getByTestId("data-badge")).toContainText("FICTIONAL businesses");
   const etaBefore = (await page.getByTestId("dest-eta").textContent())!;
   const before = /ETA (\d\d:\d\d)/.exec(etaBefore)![1];

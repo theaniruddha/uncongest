@@ -1,10 +1,10 @@
 import { defineConfig } from "@playwright/test";
 
-// Browser tests against the running app. Uses the system Chrome (channel "chrome").
-// Start the app first (`npm run dev`), or let Playwright start it via webServer.
+// One browser owner and an isolated, keyless server: never inherit a developer's live providers.
 const PORT = Number(process.env.E2E_PORT ?? 3124);
 export default defineConfig({
   testDir: "e2e",
+  workers: 1,
   timeout: 120_000,
   expect: { timeout: 30_000 },
   reporter: [["list"]],
@@ -18,9 +18,26 @@ export default defineConfig({
   outputDir: "test-results",
   webServer: {
     // Deterministic + free: mock AI and its own build dir, so it can run beside your normal dev server.
-    command: `AI_PROVIDER=mock NEXT_DIST_DIR=.next-e2e npx next dev -p ${PORT}`,
+    command: `npx next dev -p ${PORT}`,
+    env: {
+      UNCONGEST_MODE: "demo",
+      AI_PROVIDER: "mock",
+      MODEL_API_KEY: "",
+      MUSE_API_KEY: "",
+      META_API_KEY: "",
+      META_MODEL_API_KEY: "",
+      MISTRAL_API_KEY: "",
+      TOMTOM_API_KEY: "",
+      TOMTOM_LIVE: "0",
+      OSRM_LIVE: "0",
+      OVERPASS_LIVE: "0",
+      NOMINATIM_LIVE: "0",
+      OPEN_METEO_LIVE: "0",
+      OPEN_METEO_WINDOW_LIMIT: "0",
+      NEXT_DIST_DIR: ".next-e2e"
+    },
     url: `http://localhost:${PORT}/simulate`,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120_000
   }
 });

@@ -173,7 +173,7 @@ test("route alternatives: shown, compared on lunch options, suggested on evidenc
   });
   await page.route("**/api/strategic", (r) => r.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "off in test" }) }));
   await page.goto("/trip");
-  await page.getByRole("button", { name: /3-minute demo/ }).click();
+  await page.getByRole("button", { name: /Early start, lunch overdue/ }).click();
   await page.getByLabel("Departure time").fill("11:40"); // the short test route then falls inside the lunch window
   await page.getByRole("button", { name: "Plan route & start simulation" }).click();
   await expect(page.getByTestId("route-options")).toBeVisible({ timeout: 15_000 });

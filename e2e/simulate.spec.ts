@@ -57,7 +57,7 @@ test("milestone: one car → ambient watcher → proactive lunch recommendation 
   // no duplicate notification while the situation hasn't changed
   await scrubTo(page, 138);
   await scrubTo(page, 140);
-  await expect(log(page).getByText(/Agent 2 \(mock\) → PROPOSE_STOP/)).toHaveCount(1);
+  await expect(log(page).getByText(/Agent 2 \(Mock · deterministic\) → PROPOSE_STOP/)).toHaveCount(1);
 
   // inspector shows the bounded exploration trace
   await expect(page.locator("li", { hasText: /urgency low: horizon farther ahead/ })).toBeVisible();
@@ -65,7 +65,7 @@ test("milestone: one car → ambient watcher → proactive lunch recommendation 
   // skip → excluded and re-planned; approve → watcher quiet
   await page.getByRole("button", { name: "Skip this stop" }).first().click();
   await expect(page.getByText(/Skipped: harvest_table_demo/)).toBeVisible();
-  await expect(log(page).getByText(/Agent 2 \(mock\) → PROPOSE_STOP/)).toHaveCount(2); // re-planned once
+  await expect(log(page).getByText(/Agent 2 \(Mock · deterministic\) → PROPOSE_STOP/)).toHaveCount(2); // re-planned once
   await expect(page.locator("h3", { hasText: "Harvest Table" })).toHaveCount(0);
   await expect(page.locator("h3", { hasText: "Big-Box Mart" })).toBeVisible();
   await page.getByRole("button", { name: "Lead approve" }).first().click();
