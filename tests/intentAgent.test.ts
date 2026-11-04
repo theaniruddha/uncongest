@@ -62,7 +62,7 @@ describe("Agent 1 interpretIntent (Muse structured)", () => {
     expect(res.updates[0]).toMatchObject({ carId: "car-a", addNeeds: ["restroom"], restroomUrgent: true, addDietary: ["vegetarian"] });
     const call = museMock.callMuseStructured.mock.calls[0][0];
     expect(call.effort).toBe("minimal");
-    expect(call.deadlineMs).toBe(4000);
+    expect(call.deadlineMs).toBe(8000);
     expect(call.jsonSchema).toBe(INTENT_JSON_SCHEMA);
     expect(call.system).toMatch(/add, change or retract/);
     expect(JSON.parse(call.user).message).toBe(REQ.text);

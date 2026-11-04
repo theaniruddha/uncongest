@@ -393,7 +393,16 @@ interface ResolveOpts {
   fetchImpl?: FetchImpl;
   /** "inline" (default): wait for exits. "defer": return geometry ASAP with exitsStatus "pending". */
   exits?: ExitsMode;
+  /** Up to 2 intermediate points the route must pass through (part of the route id). */
+  via?: ViaPoint[];
 }
+export interface ViaPoint {
+  lat: number;
+  lng: number;
+}
+const MAX_VIA = 2;
+const viaKey = (via?: ViaPoint[]) => (via && via.length ? `|via:${via.map((v) => `${v.lat.toFixed(3)},${v.lng.toFixed(3)}`).join(";")}` : "");
+const lngLatList = (pts: Array<{ lat: number; lng: number }>) => pts.map((p) => `${p.lng.toFixed(5)},${p.lat.toFixed(5)}`).join(";");
 
 /** Memory cache keyed by route id (id is a hash of the rounded endpoints). */
 const routeCache = new Map<string, { at: number; ttl: number; route: TripRoute }>();
@@ -475,7 +484,9 @@ async function loadGeometry(origin: PlaceRef, destination: PlaceRef, id: string,
   const osrmBudget = getBudget("osrm");
   const refused = osrmBudget.take(opts.sessionId);
   if (refused) throw new RoutingServiceUnavailableError(refused);
-  const url = `${OSRM_BASE}/route/v1/driving/${origin.lng.toFixed(5)},${origin.lat.toFixed(5)};${destination.lng.toFixed(5)},${destination.lat.toFixed(5)}?overview=full&geometries=geojson&steps=true&alternatives=true`;
+  const via = (opts.via ?? []).slice(0, MAX_VIA);
+  // OSRM only offers alternatives=true for 2-coordinate requests.
+  const url = `${OSRM_BASE}/route/v1/driving/${lngLatList([origin, ...via, destination])}?overview=full&geometries=geojson&steps=true${via.length ? "" : "&alternatives=true"}`;
   const osrmCall = fetchJson(url, OSRM_TIMEOUT_MS, opts.fetchImpl).catch((err: Error) => {
     const msg = err.name === "AbortError" ? "timeout after 20 s" : err.message;
     osrmBudget.error(msg);
@@ -571,6 +582,8 @@ async function computeExits(base: TripRoute, opts: ResolveOpts): Promise<TripRou
   }
   const route = tripRouteSchema.parse({
     ...base,
+    // alternatives may have been generated while exits were loading
+    alternatives: getStoredRoute(base.id)?.alternatives ?? base.alternatives,
     exits,
     borderCrossings,
     exitsStatus: degraded ? "degraded" : "ready",
@@ -591,7 +604,7 @@ async function computeExits(base: TripRoute, opts: ResolveOpts): Promise<TripRou
  */
 export async function resolveExits(
   routeId: string,
-  opts: { sessionId?: string; fetchImpl?: FetchImpl; origin?: PlaceRef; destination?: PlaceRef } = {}
+  opts: { sessionId?: string; fetchImpl?: FetchImpl; origin?: PlaceRef; destination?: PlaceRef; via?: ViaPoint[] } = {}
 ): Promise<TripRoute> {
   const relabel = (r: TripRoute): TripRoute =>
     opts.origin && opts.destination ? { ...r, origin: opts.origin, destination: opts.destination } : r;
@@ -609,7 +622,7 @@ export async function resolveExits(
   }
   if (!base) {
     if (!opts.origin || !opts.destination) throw new RouteUnavailableError(`Unknown route id "${routeId}" — resolve the route first`);
-    const r = await resolveRoute(opts.origin, opts.destination, { sessionId: opts.sessionId, fetchImpl: opts.fetchImpl, exits: "defer" });
+    const r = await resolveRoute(opts.origin, opts.destination, { sessionId: opts.sessionId, fetchImpl: opts.fetchImpl, exits: "defer", via: opts.via });
     if (r.exitsStatus !== "pending") return r;
     if (r.id !== routeId) return resolveExits(r.id, opts);
     base = freshCached(r.id) ?? r;
@@ -626,14 +639,15 @@ export async function resolveExits(
 
 export async function resolveRoute(origin: PlaceRef, destination: PlaceRef, opts: ResolveOpts = {}): Promise<TripRoute> {
   const mode: ExitsMode = opts.exits ?? "inline";
-  // a. offline fixture
-  if (isFixtureTrip(origin, destination)) {
+  const via = (opts.via ?? []).slice(0, MAX_VIA);
+  // a. offline fixture (only for the plain trip, no via points)
+  if (via.length === 0 && isFixtureTrip(origin, destination)) {
     const r = fixtureRoute(origin, destination);
     storeRoute(r);
     return r;
   }
 
-  const key = endpointKey(origin, destination);
+  const key = endpointKey(origin, destination) + viaKey(via);
   const id = `osrm-${hash(key)}`;
   const osrmBudget = getBudget("osrm");
   const asCached = (cached: TripRoute, suffix = ""): TripRoute => {
@@ -685,7 +699,7 @@ export async function resolveRoute(origin: PlaceRef, destination: PlaceRef, opts
   // c. OSRM geometry (deduped per id)
   let geom = geometryInflight.get(id);
   if (!geom) {
-    geom = loadGeometry(origin, destination, id, opts);
+    geom = loadGeometry(origin, destination, id, { ...opts, via });
     geometryInflight.set(id, geom);
     geom.then(
       () => geometryInflight.delete(id),
@@ -705,6 +719,234 @@ export function clearRoutingCache(): void {
   geometryById.clear();
   geometryInflight.clear();
   exitsInflight.clear();
+  altCache.clear();
+  altInflight.clear();
+}
+
+// ---------- generated alternatives (via points) ----------
+
+export type RouteAlternative = TripRoute["alternatives"][number];
+
+const ALT_MAX_DURATION_RATIO = 1.35;
+const ALT_MAX_DISTANCE_RATIO = 1.4;
+/** An alternative must actually leave the main route for a meaningful distance (shared start/end legs are normal). */
+const ALT_MIN_DIVERGENT_KM = 15;
+const ALT_MIN_DIVERGENT_FRACTION = 0.15;
+/** Two alternatives that share this much are the same option. */
+const ALT_DUPLICATE_OVERLAP = 0.85;
+const ALT_OVERLAP_KM = 1.5;
+const ALT_SAMPLE_KM = 2;
+const altCache = new Map<string, { at: number; ttl: number; alternatives: RouteAlternative[] }>();
+const altInflight = new Map<string, Promise<RouteAlternative[]>>();
+
+/** Point `distKm` from (lat,lng) along compass `bearingDeg` (spherical). */
+function offsetPoint(lat: number, lng: number, bearingDeg: number, distKm: number): ViaPoint {
+  const R = 6371.0088;
+  const δ = distKm / R;
+  const θ = toRad(bearingDeg);
+  const φ1 = toRad(lat);
+  const λ1 = toRad(lng);
+  const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(Math.sin(θ) * Math.sin(δ) * Math.cos(φ1), Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
+  return { lat: +((φ2 * 180) / Math.PI).toFixed(5), lng: +((((λ2 * 180) / Math.PI + 540) % 360) - 180).toFixed(5) };
+}
+
+/** Fraction of `line`'s points (sampled every 2 km) lying within 1.5 km of `other`. */
+export function routeOverlap(line: LngLat[], other: LngLat[]): number {
+  if (line.length < 2 || other.length < 2) return 0;
+  const cumLine = cumulativeKm(line);
+  const total = cumLine[cumLine.length - 1];
+  const cumOther = cumulativeKm(other);
+  const samples: LngLat[] = [];
+  let j = 1;
+  for (let km = 0; km <= total; km += ALT_SAMPLE_KM) {
+    while (j < line.length - 1 && cumLine[j] < km) j++;
+    const span = Math.max(cumLine[j] - cumLine[j - 1], 1e-9);
+    const t = Math.min(Math.max((km - cumLine[j - 1]) / span, 0), 1);
+    samples.push([line[j - 1][0] + (line[j][0] - line[j - 1][0]) * t, line[j - 1][1] + (line[j][1] - line[j - 1][1]) * t]);
+  }
+  samples.push(line[line.length - 1]);
+  const near = samples.filter(([lng, lat]) => projectOnto(other, cumOther, lat, lng).offRouteKm <= ALT_OVERLAP_KM).length;
+  return near / samples.length;
+}
+
+/** Candidate via points: ~45 % / ~55 % along the route, offset ±d perpendicular to the heading. */
+export function viaCandidates(main: TripRoute): ViaPoint[] {
+  const model = routeModelFor(main);
+  const d = Math.min(Math.max(0.12 * model.totalKm, 15), 45);
+  const out: ViaPoint[] = [];
+  // Mid-route first (both sides), then later in the trip where the corridors often split (e.g. I-90 vs local roads).
+  for (const frac of [0.45, 0.55, 0.7]) {
+    const p = model.pointAtKm(model.totalKm * frac);
+    const sides = frac === 0.55 ? [90, -90] : [-90, 90];
+    for (const s of sides) out.push(offsetPoint(p.lat, p.lng, (p.headingDeg + s + 360) % 360, d));
+  }
+  return out;
+}
+
+function joinSummaries(r: OsrmRoute): string {
+  const parts: string[] = [];
+  for (const leg of r.legs ?? []) {
+    for (const part of (leg.summary ?? "").split(",")) {
+      const n = part.trim();
+      if (n && !parts.includes(n)) parts.push(n);
+    }
+  }
+  if (parts.length) return parts.join(", ");
+  for (const leg of r.legs ?? []) {
+    for (const step of leg.steps ?? []) {
+      const n = (step.ref || step.name || "").trim();
+      if (n && !parts.includes(n)) parts.push(n);
+      if (parts.length >= 4) return parts.join(", ");
+    }
+  }
+  return parts.join(", ") || "Alternative route";
+}
+
+const altFile = (id: string) => path.join(routeCacheDir(), `${safeId(id)}.alternatives.json`);
+
+async function readAltFile(id: string): Promise<RouteAlternative[] | null> {
+  try {
+    const j = JSON.parse(await readFile(altFile(id), "utf8")) as { at?: number; alternatives?: unknown };
+    if (typeof j.at !== "number" || Date.now() - j.at > TTL_MS) return null;
+    const parsed = tripRouteSchema.shape.alternatives.safeParse(j.alternatives);
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeAltFile(id: string, alternatives: RouteAlternative[]): Promise<void> {
+  try {
+    await mkdir(routeCacheDir(), { recursive: true });
+    const file = altFile(id);
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, JSON.stringify({ at: Date.now(), alternatives }));
+    await rename(tmp, file);
+  } catch (err) {
+    console.warn(`[routing] alternatives cache write skipped: ${(err as Error).message}`);
+  }
+}
+
+/** Attach alternatives to the stored main route (and its memory-cache entry, keeping its TTL). */
+function attachAlternatives(id: string, alternatives: RouteAlternative[]): void {
+  const stored = getStoredRoute(id);
+  if (stored) storeRoute({ ...stored, alternatives });
+  const entry = routeCache.get(id);
+  if (entry) entry.route = { ...entry.route, alternatives };
+}
+
+/**
+ * Real alternatives for a stored main route: OSRM-native alternatives first, then (if fewer than
+ * `maxAlternatives`) forced via-point detours, accepted only when ≤ 1.35× duration, ≤ 1.4× distance, diverging ≥ max(15 km, 15 %) from the main route
+ * and genuinely different (< 60 % of points within 1.5 km of the main route or an accepted alternative).
+ * Budgeted (osrm), cached 24 h per main route id (memory + disk), concurrent calls de-duplicated.
+ * If the budget runs out or OSRM fails mid-way, returns what it has (cached for 10 min only).
+ */
+export async function generateAlternatives(
+  routeId: string,
+  opts: { sessionId?: string; fetchImpl?: FetchImpl; maxAlternatives?: number } = {}
+): Promise<RouteAlternative[]> {
+  const max = Math.max(0, Math.min(opts.maxAlternatives ?? 2, 4));
+  const hit = altCache.get(routeId);
+  if (hit && Date.now() - hit.at < hit.ttl) {
+    getBudget("osrm").hit();
+    attachAlternatives(routeId, hit.alternatives);
+    return hit.alternatives;
+  }
+  const pending = altInflight.get(routeId);
+  if (pending) return pending;
+  const main = freshCached(routeId) ?? getStoredRoute(routeId);
+  if (!main) throw new RouteUnavailableError(`Unknown route id "${routeId}" — resolve the route first`);
+
+  const run = (async (): Promise<RouteAlternative[]> => {
+    const disk = await readAltFile(routeId);
+    if (disk) {
+      getBudget("osrm").hit();
+      altCache.set(routeId, { at: Date.now(), ttl: TTL_MS, alternatives: disk });
+      attachAlternatives(routeId, disk);
+      return disk;
+    }
+    const t0 = Date.now();
+    const native = main.alternatives.filter((a) => !a.via);
+    const accepted: RouteAlternative[] = [...native];
+    const mainCoords = main.coordinates as LngLat[];
+    let complete = true;
+    let n = 0;
+    const log: string[] = [];
+    const budget = getBudget("osrm");
+    // Evaluate every via candidate (one cached batch), then keep the fastest distinct options —
+    // stopping at the first acceptable ones would miss better corridors later in the trip (e.g. I-90).
+    for (const v of accepted.length < max ? viaCandidates(main) : []) {
+      const refused = budget.take(opts.sessionId);
+      if (refused) {
+        console.warn(`[routing] alternatives stopped: ${refused}`);
+        complete = false;
+        break;
+      }
+      const url = `${OSRM_BASE}/route/v1/driving/${lngLatList([main.origin, v, main.destination])}?overview=full&geometries=geojson&steps=true`; // steps → reliable leg summaries
+      let r: OsrmRoute | undefined;
+      try {
+        const resp = await fetchJson(url, OSRM_TIMEOUT_MS, opts.fetchImpl);
+        const body = resp.json as { code?: string; routes?: OsrmRoute[] } | null;
+        if (body?.code === "Ok") r = body.routes?.[0];
+        else if (!body || typeof body.code !== "string") complete = false;
+      } catch (err) {
+        budget.error((err as Error).message);
+        complete = false;
+      }
+      const tag = `via ${v.lat},${v.lng}`;
+      if (!r || !r.geometry?.coordinates || r.geometry.coordinates.length < 2) {
+        log.push(`${tag}: no route`);
+        continue;
+      }
+      const distanceKm = +(r.distance / 1000).toFixed(2);
+      const durationMinutes = +(r.duration / 60).toFixed(1);
+      const summary = joinSummaries(r);
+      if (durationMinutes > main.durationMinutes * ALT_MAX_DURATION_RATIO || distanceKm > main.distanceKm * ALT_MAX_DISTANCE_RATIO) {
+        log.push(`${tag}: too long (${durationMinutes} min / ${distanceKm} km, ${summary})`);
+        continue;
+      }
+      const coords = simplifyRoute(r.geometry.coordinates, SIMPLIFY_TOLERANCE_KM, 300);
+      const overlap = routeOverlap(coords, mainCoords);
+      const divergentKm = (1 - overlap) * distanceKm;
+      const minDivergent = Math.max(ALT_MIN_DIVERGENT_KM, ALT_MIN_DIVERGENT_FRACTION * main.distanceKm);
+      if (divergentKm < minDivergent) {
+        log.push(`${tag}: only ${Math.round(divergentKm)} km differs from main (< ${Math.round(minDivergent)} km; ${summary})`);
+        continue;
+      }
+      if (accepted.some((a) => routeOverlap(coords, a.coordinates as LngLat[]) >= ALT_DUPLICATE_OVERLAP)) {
+        log.push(`${tag}: duplicate of an accepted alternative (${summary})`);
+        continue;
+      }
+      log.push(`${tag}: accepted (${durationMinutes} min, ${Math.round(overlap * 100)}% overlap, ${summary})`);
+      n++;
+      accepted.push({ id: `${routeId}-via${n}`, distanceKm, durationMinutes, summary, coordinates: coords, via: [v] });
+    }
+    const viaAccepted = accepted.filter((a) => a.via).sort((a, b) => a.durationMinutes - b.durationMinutes);
+    const chosen: RouteAlternative[] = [...accepted.filter((a) => !a.via)];
+    for (const a of viaAccepted) {
+      if (chosen.length >= max) break;
+      if (chosen.some((c) => routeOverlap(a.coordinates as LngLat[], c.coordinates as LngLat[]) >= ALT_DUPLICATE_OVERLAP)) continue;
+      chosen.push(a);
+    }
+    chosen.forEach((a, i) => {
+      if (a.via) a.id = `${routeId}-via${i + 1 - chosen.filter((c) => !c.via).length}`;
+    });
+    accepted.length = 0;
+    accepted.push(...chosen);
+    altCache.set(routeId, { at: Date.now(), ttl: complete ? TTL_MS : DEGRADED_TTL_MS, alternatives: accepted });
+    attachAlternatives(routeId, accepted);
+    if (complete) await writeAltFile(routeId, accepted);
+    console.info(`[routing] ${routeId} alternatives ${Date.now() - t0}ms (${native.length} native, ${n} via${complete ? "" : ", incomplete"})${log.length ? `\n  ${log.join("\n  ")}` : ""}`);
+    return accepted;
+  })();
+  altInflight.set(routeId, run);
+  try {
+    return await run;
+  } finally {
+    altInflight.delete(routeId);
+  }
 }
 
 

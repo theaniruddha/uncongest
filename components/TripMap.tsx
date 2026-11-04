@@ -16,6 +16,10 @@ export interface TripMapProps {
   /** Small caption under the map (data provenance). */
   caption?: string;
   heightClass?: string;
+  /** Real alternative routes (dashed); click to inspect/choose. */
+  alternatives?: Array<{ id: string; coordinates: Array<[number, number]>; label: string }>;
+  highlightedAltId?: string | null;
+  onSelectAlternative?: (id: string) => void;
   cars: Array<Pick<SimCarState, "id" | "label" | "lat" | "lng" | "headingDeg" | "speedKph" | "positionUpdatedMinutesAgo">>;
   stops: StopCandidate[];
   upcomingExitIds: string[];
@@ -71,6 +75,7 @@ export default function TripMap(props: TripMapProps) {
   const exitLayer = useRef<Leaflet.LayerGroup | null>(null);
   const routeLayer = useRef<Leaflet.LayerGroup | null>(null);
   const fittedRouteId = useRef<string | null>(null);
+  const altLayer = useRef<Leaflet.LayerGroup | null>(null);
   const route = props.route ?? TORONTO_MONTREAL;
   const propsRef = useRef(props);
   propsRef.current = props;
@@ -95,6 +100,7 @@ export default function TripMap(props: TripMapProps) {
       });
       tiles.on("tileload", () => setTilesFailed(false));
 
+      altLayer.current = L.layerGroup().addTo(map);
       routeLayer.current = L.layerGroup().addTo(map);
       exitLayer.current = L.layerGroup().addTo(map);
       stopLayer.current = L.layerGroup().addTo(map);
@@ -128,6 +134,27 @@ export default function TripMap(props: TripMapProps) {
       fittedRouteId.current = route.id;
     }
   }, [ready, route]);
+
+  // ---- alternative routes (under the main route) ----
+  const altKey = `${(props.alternatives ?? []).map((a) => a.id).join(",")}|${props.highlightedAltId ?? ""}`;
+  useEffect(() => {
+    const L = LRef.current;
+    if (!ready || !L || !altLayer.current) return;
+    altLayer.current.clearLayers();
+    for (const a of props.alternatives ?? []) {
+      const hi = props.highlightedAltId === a.id;
+      L.polyline(
+        a.coordinates.map(([lng, lat]) => [lat, lng] as [number, number]),
+        { color: hi ? "#7c3aed" : "#64748b", weight: hi ? 5 : 4, opacity: hi ? 0.9 : 0.55, dashArray: "8 7" }
+      )
+        .bindTooltip(a.label, { sticky: true })
+        .on("click", (ev: Leaflet.LeafletMouseEvent) => {
+          L.DomEvent.stopPropagation(ev);
+          propsRef.current.onSelectAlternative?.(a.id);
+        })
+        .addTo(altLayer.current);
+    }
+  }, [ready, altKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- exits (exits along the route; upcoming reachable ones emphasised) ----
   const upcomingKey = props.upcomingExitIds.join(",");

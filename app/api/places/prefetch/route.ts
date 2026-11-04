@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 
 const place = z.object({ label: z.string().max(200), lat: z.number(), lng: z.number(), type: z.enum(["home", "hotel", "other"]).default("other") });
 const schema = z.object({
-  route: z.object({ id: z.string().min(1).max(120), origin: place, destination: place }),
+  route: z.object({ id: z.string().min(1).max(120), origin: place, destination: place, via: z.array(z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) })).max(2).optional() }),
   sessionId: z.string().min(1).max(64).default("anon"),
   windows: z
     .array(z.object({ minKm: z.number().min(0), maxKm: z.number().min(0), reason: z.string().max(120).optional() }))

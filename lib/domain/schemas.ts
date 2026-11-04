@@ -75,7 +75,8 @@ export const recommendStopsRequestSchema = z.object({
       route: z.object({
         id: z.string().min(1).max(120),
         origin: z.object({ label: z.string().max(200), lat: z.number(), lng: z.number(), type: z.enum(["home", "hotel", "other"]).default("other") }),
-        destination: z.object({ label: z.string().max(200), lat: z.number(), lng: z.number(), type: z.enum(["home", "hotel", "other"]).default("other") })
+        destination: z.object({ label: z.string().max(200), lat: z.number(), lng: z.number(), type: z.enum(["home", "hotel", "other"]).default("other") }),
+        via: z.array(z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) })).max(2).optional()
       }),
       sessionId: z.string().min(1).max(64).default("anon"),
       dataMode: z.enum(["real", "demo"]).default("real"),

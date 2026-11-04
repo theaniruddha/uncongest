@@ -5,7 +5,7 @@ import { callMuseStructured, museModelName } from "@/lib/agent2/museStructured";
 /**
  * Agent 1 — Intent & Conversation.
  * One bounded Muse call per utterance with native structured output (strict json_schema,
- * effort "minimal", hard deadline INTENT_DEADLINE_MS, default 4000 ms). It interprets a driver
+ * effort "minimal", hard deadline INTENT_DEADLINE_MS, default 8000 ms). It interprets a driver
  * voice transcript or a copassenger's text into a context PATCH (per-car intent updates), never a
  * full state rewrite. Output is Zod-validated; unknown car ids are dropped; the deterministic regex
  * parser is the fallback when Muse is disabled or the call fails for any reason.
@@ -100,7 +100,7 @@ const SYSTEM = [
 
 function deadlineMs(): number {
   const n = Number(process.env.INTENT_DEADLINE_MS);
-  return Number.isFinite(n) && n > 0 ? n : 4000;
+  return Number.isFinite(n) && n > 0 ? n : 8000;
 }
 
 export async function interpretIntent(req: IntentRequest): Promise<IntentAgentResult> {

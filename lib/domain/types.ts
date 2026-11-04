@@ -215,7 +215,7 @@ export interface RecommendStopsRequest {
   environment: Environment;
   options?: { weatherMode: "live" | "simulated"; excludeStopIds: string[] };
   context?: {
-    route: { id: string; origin: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" }; destination: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" } };
+    route: { id: string; origin: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" }; destination: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" }; via?: Array<{ lat: number; lng: number }> };
     sessionId: string;
     dataMode: "real" | "demo";
     timeZone: string;

@@ -90,7 +90,9 @@ export const tripRouteSchema = z.object({
         distanceKm: z.number(),
         durationMinutes: z.number(),
         summary: z.string(),
-        coordinates: z.array(z.tuple([z.number(), z.number()]))
+        coordinates: z.array(z.tuple([z.number(), z.number()])),
+        /** Via point(s) that forced this alternative (absent for OSRM-native alternatives). */
+        via: z.array(z.object({ lat: z.number(), lng: z.number() })).optional()
       })
     )
     .default([]),

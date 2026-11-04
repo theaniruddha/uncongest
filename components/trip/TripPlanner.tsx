@@ -7,6 +7,7 @@ import RecommendationCard from "./RecommendationCard";
 import ActiveStopCard from "./ActiveStopCard";
 import Inspector, { type Agent1Trace } from "./Inspector";
 import StrategicPanel from "./StrategicPanel";
+import RouteOptions, { type RouteOptionView } from "./RouteOptions";
 import { useStrategic } from "./useStrategic";
 import { summarize, versionHash, type WorkflowSample } from "@/lib/agent2/metrics";
 import { checkTacticalStaleness, withoutSkipped } from "@/lib/agent2/staleness";
@@ -59,6 +60,8 @@ interface Plan {
   departureUtc: Date;
   tz: string;
   departLocal: string;
+  /** Via point(s) when the user chose an alternative route. */
+  via?: Array<{ lat: number; lng: number }>;
 }
 
 interface LogEntry {
@@ -95,6 +98,8 @@ export default function TripPlanner() {
   const today = useMemo(() => todayLocalDate(), []);
   const [sessionId] = useState(() => (typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID().slice(0, 12) : `s${Date.now()}`));
   const [setup, setSetup] = useState<TripSetup>(() => defaultSetup(today));
+  const setupState = setup;
+  const planViaRef = useRef<Array<{ lat: number; lng: number }> | undefined>(undefined);
   const [setupOpen, setSetupOpen] = useState(true);
   const [plan, setPlan] = useState<Plan | null>(null);
   const [planning, setPlanning] = useState(false);
@@ -127,6 +132,9 @@ export default function TripPlanner() {
   const [staleTactical, setStaleTactical] = useState(0);
   const [strategicUpdate, setStrategicUpdate] = useState<{ title: string; reason: string; toKm: number; contextVersion: string | null } | null>(null);
   const [exitsLoading, setExitsLoading] = useState(false);
+  const [altsLoading, setAltsLoading] = useState(false);
+  const [altMeal, setAltMeal] = useState<Record<string, { count: number | null; note?: string; checking?: boolean }>>({});
+  const [highlightedAlt, setHighlightedAlt] = useState<string | null>(null);
   const playingRef = useRef(false);
   /** Token of the current decision hold; any explicit playback change clears it so it never auto-resumes. */
   const holdRef = useRef<number | null>(null);
@@ -157,6 +165,7 @@ export default function TripPlanner() {
 
   // ---------------- derived trip state ----------------
   const model = plan?.model ?? null;
+  planViaRef.current = plan?.via;
   const tz = plan?.tz ?? "America/Toronto";
   const tripCars: TripCar[] = useMemo(
     () =>
@@ -344,7 +353,9 @@ export default function TripPlanner() {
     requestedTiles.current.clear();
   };
 
-  const planRoute = async () => {
+  /** Plan (or re-plan) a route. `via` forces an alternative; `keepIntents` preserves passenger needs on a mid-trip switch. */
+  const planRoute = async (opts: { via?: Array<{ lat: number; lng: number }>; setupOverride?: TripSetup; keepIntents?: Record<string, CarIntent>; note?: string } = {}) => {
+    const setup = opts.setupOverride ?? setupState;
     const clickAt = performance.now();
     const seq = ++routeGenRef.current;
     setPlanning(true);
@@ -354,7 +365,7 @@ export default function TripPlanner() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // Progressive: geometry + baseline ETA first; exits, places, weather and Strategic follow.
-        body: JSON.stringify({ origin: setup.origin, destination: setup.destination, sessionId, exits: "defer" })
+        body: JSON.stringify({ origin: setup.origin, destination: setup.destination, sessionId, exits: "defer", ...(opts.via?.length ? { via: opts.via } : {}) })
       });
       const data = await res.json().catch(() => null);
       if (seq !== routeGenRef.current) return; // a newer Plan click superseded this one
@@ -381,12 +392,18 @@ export default function TripPlanner() {
       const anchorUtc = localDateTimeToUtc(setup.departure.date, setup.departure.time, tzone);
       const departureUtc = setup.departure.mode === "arrive_by" ? new Date(anchorUtc.getTime() - driveMin * 60000) : anchorUtc;
       const departLocal = formatInZone(departureUtc, tzone);
-      setPlan({ route, model: m, setup, departureUtc, tz: tzone, departLocal });
+      setPlan({ route, model: m, setup, departureUtc, tz: tzone, departLocal, via: opts.via });
       resetSim(setup);
+      if (opts.keepIntents) setIntents(opts.keepIntents);
+      setAltMeal({});
+      setHighlightedAlt(null);
       setDiscovering(false);
       setExitsLoading(false);
-      setLog([]);
-      setAgent1([]);
+      if (!opts.keepIntents) {
+        setLog([]);
+        setAgent1([]);
+      }
+      if (opts.note) pushLog("info", opts.note);
       setSetupOpen(false);
       const demo = setup.dataMode === "demo";
       setKnownPlaces(demo ? allFixtureStops() : []);
@@ -399,7 +416,8 @@ export default function TripPlanner() {
       );
       setStrategicUpdate(null);
       setTacticalState({ status: "idle" });
-      if (route.exitsStatus === "pending") void loadExits(route, setup, clickAt);
+      if (route.exitsStatus === "pending") void loadExits(route, setup, clickAt, opts.via);
+      if (!demo) void loadAlternatives(route, setup, opts.via);
       else setTimings((t) => ({ ...t, exitsMs: geometryMs, exitsStatus: route.exitsStatus }));
       if (!demo) {
         const windows = opportunityWindows({
@@ -421,14 +439,15 @@ export default function TripPlanner() {
     }
   };
 
-  const routeRef = (p: { route: TripRoute; setup: TripSetup }) => ({
+  const routeRef = (p: { route: TripRoute; setup: TripSetup; via?: Array<{ lat: number; lng: number }> }) => ({
     id: p.route.id,
     origin: { label: p.setup.origin.label, lat: p.setup.origin.lat, lng: p.setup.origin.lng, type: p.setup.origin.type },
-    destination: { label: p.setup.destination.label, lat: p.setup.destination.lat, lng: p.setup.destination.lng, type: p.setup.destination.type }
+    destination: { label: p.setup.destination.label, lat: p.setup.destination.lat, lng: p.setup.destination.lng, type: p.setup.destination.type },
+    ...(p.via?.length ? { via: p.via } : {})
   });
 
   /** Exits + border crossings arrive after the map is already usable. */
-  const loadExits = async (route: TripRoute, s: TripSetup, clickAt: number) => {
+  const loadExits = async (route: TripRoute, s: TripSetup, clickAt: number, via?: Array<{ lat: number; lng: number }>) => {
     const gen = routeGenRef.current;
     const isOld = () => gen !== routeGenRef.current;
     setExitsLoading(true);
@@ -436,7 +455,7 @@ export default function TripPlanner() {
       const res = await fetch("/api/route/exits", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: route.id, origin: s.origin, destination: s.destination, sessionId })
+        body: JSON.stringify({ id: route.id, origin: s.origin, destination: s.destination, sessionId, ...(via?.length ? { via } : {}) })
       });
       const data = await res.json().catch(() => null);
       if (isOld()) return; // the user planned another route meanwhile
@@ -452,7 +471,8 @@ export default function TripPlanner() {
         exits: full.exits,
         durationMinutes: full.durationMinutes
       });
-      setPlan((p) => (p && p.route.id === full.id ? { ...p, route: full, model: m } : p));
+      // Keep alternatives that may have arrived first.
+      setPlan((p) => (p && p.route.id === full.id ? { ...p, route: { ...full, alternatives: p.route.alternatives?.length ? p.route.alternatives : full.alternatives }, model: m } : p));
       const exitsMs = Math.round(performance.now() - clickAt);
       setTimings((t) => ({ ...t, exitsMs, exitsStatus: full.exitsStatus }));
       pushLog(
@@ -465,6 +485,52 @@ export default function TripPlanner() {
     } finally {
       if (!isOld()) setExitsLoading(false);
     }
+  };
+
+  /** Real alternative routes (OSRM native or via-point), loaded in the background — never blocks the map. */
+  const loadAlternatives = async (route: TripRoute, s: TripSetup, via?: Array<{ lat: number; lng: number }>) => {
+    const gen = routeGenRef.current;
+    setAltsLoading(true);
+    try {
+      const res = await fetch("/api/route/alternatives", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: route.id, origin: s.origin, destination: s.destination, sessionId, ...(via?.length ? { via } : {}) })
+      });
+      const data = await res.json().catch(() => null);
+      if (gen !== routeGenRef.current) return;
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      const alts = (data?.alternatives ?? []) as TripRoute["alternatives"];
+      setPlan((p) => (p && p.route.id === route.id ? { ...p, route: { ...p.route, alternatives: alts } } : p));
+      pushLog("info", alts.length ? `${alts.length} alternative route(s): ${alts.map((a) => `${a.summary || a.id} (${a.durationMinutes - route.durationMinutes >= 0 ? "+" : ""}${Math.round(a.durationMinutes - route.durationMinutes)} min)`).join("; ")}` : "No meaningfully different alternative route found.");
+    } catch (e) {
+      if (gen === routeGenRef.current) pushLog("info", `Alternative routes unavailable: ${(e as Error).message}`);
+    } finally {
+      if (gen === routeGenRef.current) setAltsLoading(false);
+    }
+  };
+
+  /** Switch to an alternative route: before departure re-plan normally; mid-trip re-plan from the car's current position, keeping needs. */
+  const switchToAlternative = (altId: string) => {
+    if (!plan || !lead) return;
+    const alt = plan.route.alternatives.find((a) => a.id === altId) as (TripRoute["alternatives"][number] & { via?: Array<{ lat: number; lng: number }> }) | undefined;
+    if (!alt?.via?.length) {
+      pushLog("info", "This alternative has no via point to re-plan with.");
+      return;
+    }
+    if (lead.progressKm < 1) {
+      void planRoute({ via: alt.via, setupOverride: plan.setup, note: `Switched to alternative route: ${alt.summary}.` });
+      return;
+    }
+    const here = { label: `Current position (km ${Math.round(lead.progressKm)})`, lat: lead.lat, lng: lead.lng, type: "other" as const, source: "current_location" as const };
+    const viaAhead = alt.via.filter((v) => plan.model.nearestKm(v.lat, v.lng).km > lead.progressKm + 5);
+    const s2: TripSetup = { ...plan.setup, origin: here, departure: { mode: "depart_at", date: nowLocal.date, time: nowLocal.time }, mealHistory: lastMealMinutesAgo == null ? plan.setup.mealHistory : { kind: "already_ate" } };
+    void planRoute({
+      via: viaAhead.length ? viaAhead : alt.via,
+      setupOverride: s2,
+      keepIntents: intents,
+      note: `Re-planned from km ${Math.round(lead.progressKm)} via ${alt.summary}. Passenger needs kept; rest/meal timers restart from here.`
+    });
   };
 
   const discover = async (route: TripRoute, windows: Array<{ minKm: number; maxKm: number; reason?: string }>, s: TripSetup, m: RouteModel, clickAt?: number) => {
@@ -483,7 +549,7 @@ export default function TripPlanner() {
       const res = await fetch("/api/places/prefetch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ route: routeRef({ route, setup: s }), sessionId, windows: fresh.slice(0, 3).map((w) => ({ minKm: Math.max(0, w.minKm), maxKm: Math.min(m.totalKm, w.maxKm), reason: w.reason })) })
+        body: JSON.stringify({ route: routeRef({ route, setup: s, via: planViaRef.current }), sessionId, windows: fresh.slice(0, 3).map((w) => ({ minKm: Math.max(0, w.minKm), maxKm: Math.min(m.totalKm, w.maxKm), reason: w.reason })) })
       });
       const data = await res.json().catch(() => null);
       if (isOld()) return; // places for a previous route never leak into the new one
@@ -1021,6 +1087,89 @@ export default function TripPlanner() {
     setChatBusy(false);
   };
 
+  // ---------------- route alternatives: compare food options in the meal window ----------------
+  const mealWindow = useMemo(() => {
+    if (!plan || !model) return null;
+    const ws = opportunityWindows({
+      routeKm: model.totalKm,
+      speedKph: plan.setup.cars[0].speedKph,
+      departureLocal: plan.departLocal,
+      mood: plan.setup.mood,
+      mealPreference: plan.setup.mealPreference,
+      mealHistory: plan.setup.mealHistory
+    });
+    const w = ws.find((x) => /lunch|dinner/.test(x.reason));
+    return w ? { minKm: w.minKm, maxKm: w.maxKm, label: /dinner/.test(w.reason) ? "dinner window" : "lunch window" } : null;
+  }, [plan, model]);
+
+  const mainMeal = useMemo((): { count: number | null; note?: string } => {
+    if (!mealWindow) return { count: null, note: "no meal window on this trip" };
+    if (plan?.setup.dataMode === "demo") return { count: null, note: "demo fixtures" };
+    const n = knownPlaces.filter((p) => p.categories.includes("meal") && p.distanceAlongRouteKm >= mealWindow.minKm && p.distanceAlongRouteKm <= mealWindow.maxKm).length;
+    const lookedUp = prefetchTrace.some((t) => /prefetch km \d+/.test(t));
+    const failed = prefetchTrace.length > 0 && prefetchTrace.every((t) => !/place\(s\), (live|cached)/.test(t));
+    if (n === 0 && (failed || !lookedUp)) return { count: null, note: failed ? "unknown (place data unavailable)" : discovering ? "checking…" : "not checked yet" };
+    return { count: n };
+  }, [mealWindow, knownPlaces, prefetchTrace, discovering, plan?.setup.dataMode]);
+
+  const checkAlternative = async (altId: string) => {
+    if (!plan || !mealWindow) return;
+    const alt = plan.route.alternatives.find((a) => a.id === altId) as (TripRoute["alternatives"][number] & { via?: Array<{ lat: number; lng: number }> }) | undefined;
+    if (!alt) return;
+    const gen = routeGenRef.current;
+    setAltMeal((m) => ({ ...m, [altId]: { count: null, checking: true } }));
+    // Same time window → roughly the same km range on the alternative (scaled by its length).
+    const scale = alt.distanceKm / Math.max(plan.route.distanceKm, 1);
+    const w = { minKm: mealWindow.minKm * scale, maxKm: Math.min(alt.distanceKm, mealWindow.maxKm * scale), reason: `${mealWindow.label} on ${alt.summary}` };
+    try {
+      const res = await fetch("/api/places/prefetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route: { ...routeRef(plan), id: alt.id, ...(alt.via?.length ? { via: alt.via } : {}) }, sessionId, windows: [w] })
+      });
+      const data = await res.json().catch(() => null);
+      if (gen !== routeGenRef.current) return;
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      const trace: string[] = data.trace ?? [];
+      const ok = trace.some((t) => /place\(s\), (live|cached)/.test(t));
+      const n = ((data.candidates ?? []) as StopCandidate[]).filter((c) => c.categories.includes("meal")).length;
+      setAltMeal((m) => ({ ...m, [altId]: ok ? { count: n } : { count: null, note: "unknown (place data unavailable)" } }));
+    } catch (e) {
+      if (gen === routeGenRef.current) setAltMeal((m) => ({ ...m, [altId]: { count: null, note: `unknown (${(e as Error).message})` } }));
+    }
+  };
+
+  const routeOptions = useMemo(() => {
+    if (!plan) return null;
+    const decisions = strategic.state.plan?.routeDecisions ?? [];
+    const alts: RouteOptionView[] = (plan.route.alternatives ?? []).map((a) => {
+      const d = decisions.find((x) => x.alternativeRouteId === a.id);
+      const m = altMeal[a.id];
+      return { id: a.id, summary: a.summary, durationMinutes: a.durationMinutes, distanceKm: a.distanceKm, mealOptions: m?.count ?? null, mealNote: m?.note, checking: m?.checking, strategicReason: d ? `Strategic: ${d.detail}` : undefined };
+    });
+    const main: RouteOptionView = { id: plan.route.id, summary: "", durationMinutes: plan.route.durationMinutes, distanceKm: plan.route.distanceKm, mealOptions: mainMeal.count, mealNote: mainMeal.note };
+    // Suggest only on evidence: current route's count is KNOWN and thin, and an alternative clearly has more.
+    let suggestion: { altId: string; text: string } | null = null;
+    const better = alts.filter((a) => a.mealOptions != null && main.mealOptions != null && main.mealOptions < 3 && a.mealOptions >= main.mealOptions + 2).sort((x, y) => (y.mealOptions ?? 0) - (x.mealOptions ?? 0))[0];
+    if (better && mealWindow) {
+      suggestion = { altId: better.id, text: `Food options look thin on the current route in the ${mealWindow.label} (${main.mealOptions}); via ${better.summary} has ${better.mealOptions} (${better.durationMinutes - main.durationMinutes >= 0 ? "+" : ""}${Math.round(better.durationMinutes - main.durationMinutes)} min).` };
+    } else {
+      const d = decisions.find((x) => x.alternativeRouteId && alts.some((a) => a.id === x.alternativeRouteId));
+      if (d) suggestion = { altId: d.alternativeRouteId!, text: `Strategic: ${d.title} — ${d.detail}` };
+    }
+    return { main, alts, suggestion };
+  }, [plan, altMeal, mainMeal, strategic.state.plan, mealWindow]);
+
+  // Auto-check alternatives once (bounded: ≤ 2 lookups) when the current route's meal window looks thin.
+  const autoChecked = useRef<string | null>(null);
+  useEffect(() => {
+    if (!plan || !routeOptions || plan.setup.dataMode === "demo") return;
+    if (autoChecked.current === plan.route.id) return;
+    if (routeOptions.main.mealOptions == null || routeOptions.main.mealOptions >= 3 || routeOptions.alts.length === 0) return;
+    autoChecked.current = plan.route.id;
+    for (const a of routeOptions.alts.slice(0, 2)) void checkAlternative(a.id);
+  }, [plan?.route.id, routeOptions?.main.mealOptions, routeOptions?.alts.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ---------------- render ----------------
   const presets: PresetOption[] = SCENARIO_PRESETS.map((p) => ({ id: p.id, title: p.title, blurb: p.blurb }));
   const recIds = result?.recommendations.map((r) => r.stopId) ?? [];
@@ -1050,7 +1199,7 @@ export default function TripPlanner() {
               presets={presets}
               onApplyPreset={applyPreset}
               placePresets={NAMED_PLACES}
-              onPlan={planRoute}
+              onPlan={() => void planRoute()}
               planning={planning}
               planError={planError}
               canStart={Boolean(setup.origin && setup.destination)}
@@ -1157,6 +1306,13 @@ export default function TripPlanner() {
             detourStopIds={stops.filter((s) => s.status !== "CANCELLED").map((s) => s.stopId)}
             onPlaceCar={onPlaceCar}
             onSelectStop={setSelectedStopId}
+            alternatives={(plan?.route.alternatives ?? []).map((a) => ({
+              id: a.id,
+              coordinates: a.coordinates,
+              label: `Alternative: ${a.summary} · ${a.durationMinutes - (plan?.route.durationMinutes ?? 0) >= 0 ? "+" : ""}${Math.round(a.durationMinutes - (plan?.route.durationMinutes ?? 0))} min (click to compare)`
+            }))}
+            highlightedAltId={highlightedAlt}
+            onSelectAlternative={(id) => setHighlightedAlt(id)}
             heightClass="h-[360px] sm:h-[460px]"
             caption={`${model.origin} → ${model.destination} · ${model.totalKm.toFixed(0)} km · ${model.exits().length} exits · ${model.attribution}. Drag a car to reposition it.`}
           />
@@ -1183,6 +1339,19 @@ export default function TripPlanner() {
             nextOpportunityKm={watchDecision?.nextOpportunity?.km ?? null}
             gapAfterKm={watchDecision?.gapAfterKm ?? null}
             onSelectStop={setSelectedStopId}
+          />
+        )}
+        {routeOptions && plan?.setup.dataMode !== "demo" && (
+          <RouteOptions
+            main={routeOptions.main}
+            alternatives={routeOptions.alts}
+            loading={altsLoading}
+            highlightedId={highlightedAlt}
+            onHighlight={setHighlightedAlt}
+            onCheck={(id) => void checkAlternative(id)}
+            onUse={(id) => switchToAlternative(id)}
+            mealWindowLabel={mealWindow?.label ?? null}
+            suggestion={routeOptions.suggestion}
           />
         )}
         {selectedStopId &&

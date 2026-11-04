@@ -10,7 +10,9 @@ const requestSchema = z.object({
   destination: placeRefSchema,
   sessionId: z.string().max(100).optional(),
   /** "defer": return geometry immediately (exitsStatus "pending"); fetch exits via POST /api/route/exits. */
-  exits: z.enum(["inline", "defer"]).optional()
+  exits: z.enum(["inline", "defer"]).optional(),
+  /** Up to 2 via points the route must pass through (e.g. a chosen alternative's via). */
+  via: z.array(z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) })).max(2).optional()
 });
 
 /** POST {origin, destination, sessionId?} → TripRoute (fixture / cache / OSRM). */
@@ -25,9 +27,9 @@ export async function POST(req: Request) {
   if (!parsed.success) {
     return NextResponse.json({ error: "schema validation failed", issues: parsed.error.issues }, { status: 422 });
   }
-  const { origin, destination, sessionId, exits } = parsed.data;
+  const { origin, destination, sessionId, exits, via } = parsed.data;
   try {
-    return NextResponse.json(await resolveRoute(origin, destination, { sessionId, exits }));
+    return NextResponse.json(await resolveRoute(origin, destination, { sessionId, exits, via }));
   } catch (err) {
     if (err instanceof RouteUnavailableError) {
       return NextResponse.json({ error: err.message, suggestion: "Try the Toronto → Montréal demo preset" }, { status: 404 });

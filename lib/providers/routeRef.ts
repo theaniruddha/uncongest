@@ -7,6 +7,8 @@ export interface RouteRef {
   id: string;
   origin: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" };
   destination: { label: string; lat: number; lng: number; type: "home" | "hotel" | "other" };
+  /** Via point(s) of a user-chosen alternative route. */
+  via?: Array<{ lat: number; lng: number }>;
 }
 
 export interface RouteModelForRefOpts {
@@ -45,7 +47,7 @@ export async function routeModelForRef(ref: RouteRef, sessionId?: string, opts: 
   if (!stored) {
     const origin = { ...ref.origin, source: "search" as const };
     const destination = { ...ref.destination, source: "search" as const };
-    stored = await resolveRoute(origin, destination, { sessionId, exits: opts.exits ?? "defer" });
+    stored = await resolveRoute(origin, destination, { sessionId, exits: opts.exits ?? "defer", ...(ref.via?.length ? { via: ref.via } : {}) } as Parameters<typeof resolveRoute>[2]);
     if (stored.exitsStatus === "pending") {
       // Fill exits in the background (deduped per id); a later call picks them up from the store.
       const exits = resolveExits(stored.id, { sessionId, origin, destination });

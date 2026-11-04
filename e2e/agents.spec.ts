@@ -143,3 +143,49 @@ test("Tactical status is shown for real decisions (deterministic fallback under 
   await expect(page.getByTestId("perf")).toContainText("Tactical (5 s)");
   await expect(page.getByTestId("perf")).toContainText("Map + route + baseline ETA");
 });
+
+test("route alternatives: shown, compared on lunch options, suggested on evidence, and chosen only by the user", async ({ page }) => {
+  const routeBodies: Array<Record<string, unknown>> = [];
+  await page.route("**/api/route", async (r) => {
+    const body = r.request().postDataJSON();
+    routeBodies.push(body);
+    await r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SHORT_ROUTE(body.via ? "t-alt-via" : "t-alt-main")) });
+  });
+  const altCoords: Array<[number, number]> = [];
+  for (let i = 0; i <= 40; i++) altCoords.push([-79.6435 + (i / 40) * 0.8, 43.5795 - (i / 40) * 0.35 + Math.sin((i / 40) * Math.PI) * 0.15]);
+  await page.route("**/api/route/alternatives", (r) =>
+    r.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "t-alt-main",
+        alternatives: [{ id: "t-alt-main-via1", distanceKm: 82, durationMinutes: 62, summary: "QEW, I-90", coordinates: altCoords, via: [{ lat: 43.45, lng: -79.2 }] }]
+      })
+    })
+  );
+  const place = (id: string, km: number) => ({ id, name: id, type: "restaurant", categories: ["meal"], region: "", exitId: "e1", distanceAlongRouteKm: km, lat: 43.4, lng: -79.2, isMock: false, source: "osm", vegetarianVerified: null, restroomsVerified: null, parkingVerified: null, qualityScoreMock: 0.6, open24h: false, accessMinutes: 4 });
+  await page.route("**/api/places/prefetch", async (r) => {
+    const body = r.request().postDataJSON();
+    const onAlt = String(body.route.id).includes("via1");
+    const cands = onAlt ? [place("a1", 40), place("a2", 45), place("a3", 50), place("a4", 55)] : [];
+    const trace = body.windows.map((w: { minKm: number; maxKm: number }) => `prefetch km ${Math.floor(w.minKm)}–${Math.ceil(w.maxKm)}: ${cands.length} place(s), cached`);
+    await r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ trace, candidates: cands, usage: [] }) });
+  });
+  await page.route("**/api/strategic", (r) => r.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "off in test" }) }));
+  await page.goto("/trip");
+  await page.getByRole("button", { name: /3-minute demo/ }).click();
+  await page.getByLabel("Departure time").fill("11:40"); // the short test route then falls inside the lunch window
+  await page.getByRole("button", { name: "Plan route & start simulation" }).click();
+  await expect(page.getByTestId("route-options")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("route-alt")).toHaveCount(1);
+  await expect(page.getByTestId("route-alt")).toContainText("QEW, I-90");
+  await expect(page.getByTestId("route-alt")).toContainText("+12 min");
+  // current route has 0 food places in the lunch window → alternative auto-checked → evidence-based suggestion
+  await expect(page.getByTestId("route-alt")).toContainText("4 food place(s)", { timeout: 15_000 });
+  await expect(page.getByTestId("route-suggestion")).toContainText(/thin on the current route.*QEW, I-90 has 4/);
+  expect(routeBodies).toHaveLength(1); // nothing rerouted automatically
+  await page.getByRole("button", { name: "Use this route" }).click();
+  await expect.poll(() => routeBodies.length).toBe(2);
+  expect(routeBodies[1].via).toEqual([{ lat: 43.45, lng: -79.2 }]);
+  await expect(page.getByTestId("trip-log").getByText(/Switched to alternative route: QEW, I-90/)).toBeVisible();
+});

@@ -56,7 +56,7 @@ const validTimeZone = (tz: string) => {
 };
 
 export const strategicInputSchema = z.object({
-  routeRef: z.object({ id: z.string().min(1).max(200), origin: placeSchema, destination: placeSchema }),
+  routeRef: z.object({ id: z.string().min(1).max(200), origin: placeSchema, destination: placeSchema, via: z.array(z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) })).max(2).optional() }),
   routeVersion: z.string().min(1).max(120),
   contextVersion: z.string().min(1).max(120),
   sessionId: z.string().min(1).max(120),
