@@ -1,3 +1,5 @@
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import routeFixture from "@/data/routes/toronto-montreal.json";
 import { createRouteModel, cumulativeKm, haversineKm, projectOnto, type RouteExit, type RouteModel } from "@/lib/route/model";
 import { tripRouteSchema, type PlaceRef, type TripRoute } from "@/lib/trip/types";
@@ -6,13 +8,16 @@ import { overpassQuery, type OverpassElement } from "./overpass";
 
 /**
  * Real route resolution for the configurable trip simulator. Server-only.
- * Order: offline fixture (Toronto → Montréal) → 24 h memory cache → OSRM demo server.
+ * Order: offline fixture (Toronto → Montréal) → memory cache (24 h; 10 min for degraded routes)
+ * → runtime disk cache → committed recordings (data/recorded/routes) → OSRM demo server.
  * Exits come from OSM motorway_junction nodes (Overpass, corridor bboxes) with an OSRM
  * off-ramp maneuver fallback. Geometry is never fabricated: no route → RouteUnavailableError.
  */
 const OSRM_BASE = process.env.OSRM_URL || "https://router.project-osrm.org";
 const UA = "uncongest-sim/0.2 (road-trip simulator)";
 const TTL_MS = 24 * 60 * 60 * 1000;
+/** Routes whose exits are degraded (OSRM ramp steps / none) are retried after 10 min. */
+const DEGRADED_TTL_MS = 10 * 60 * 1000;
 const OSRM_TIMEOUT_MS = 20000;
 const MAX_POINTS = 4000;
 const SIMPLIFY_TOLERANCE_KM = 0.03;
@@ -297,9 +302,55 @@ export function routeModelFor(route: TripRoute): RouteModel {
   });
 }
 
+// ---------- disk persistence (server-only; every fs call tolerates failure) ----------
+
+/** Runtime cache dir (writable). Evaluated per call so tests / deployments can override via env. */
+export function routeCacheDir(): string {
+  const base = process.env.UNCONGEST_CACHE_DIR || (process.env.VERCEL ? "/tmp/uncongest-cache" : ".cache");
+  return path.join(base, "routes");
+}
+
+/** Committed recordings (read-only at runtime). UNCONGEST_RECORDED_DIR overrides for tests. */
+export function recordedRoutesDir(): string {
+  return process.env.UNCONGEST_RECORDED_DIR || path.join(process.cwd(), "data", "recorded", "routes");
+}
+
+const safeId = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, "_");
+
+async function readRouteFile(file: string): Promise<TripRoute | null> {
+  try {
+    const parsed = tripRouteSchema.safeParse(JSON.parse(await readFile(file, "utf8")));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeRouteFile(dir: string, route: TripRoute): Promise<string> {
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${safeId(route.id)}.json`);
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, JSON.stringify(route));
+  await rename(tmp, file);
+  return file;
+}
+
+async function persistRoute(route: TripRoute): Promise<void> {
+  try {
+    await writeRouteFile(routeCacheDir(), route);
+  } catch (err) {
+    console.warn(`[routing] route cache write skipped: ${(err as Error).message}`);
+  }
+}
+
+/** Write a route to data/recorded/routes/<id>.json (recorder script). Returns the file path. */
+export async function recordRoute(route: TripRoute): Promise<string> {
+  return writeRouteFile(recordedRoutesDir(), tripRouteSchema.parse(route));
+}
+
 // ---------- resolve ----------
 
-const routeCache = new Map<string, { at: number; route: TripRoute }>();
+const routeCache = new Map<string, { at: number; ttl: number; route: TripRoute }>();
 
 function fixtureRoute(origin: PlaceRef, destination: PlaceRef): TripRoute {
   const coords = routeFixture.coordinates as LngLat[];
@@ -334,15 +385,32 @@ export async function resolveRoute(
     return r;
   }
 
-  // b. memory cache
   const key = endpointKey(origin, destination);
+  const id = `osrm-${hash(key)}`;
   const osrmBudget = getBudget("osrm");
-  const hit = routeCache.get(key);
-  if (hit && Date.now() - hit.at < TTL_MS) {
+  const fromCache = (cached: TripRoute, suffix = ""): TripRoute => {
     osrmBudget.hit();
-    const r: TripRoute = { ...hit.route, origin, destination, source: "cache" };
+    const r: TripRoute = { ...cached, origin, destination, source: "cache", attribution: cached.attribution + suffix };
     storeRoute(r);
     return r;
+  };
+
+  // b. memory cache
+  const hit = routeCache.get(key);
+  if (hit && Date.now() - hit.at < hit.ttl) return fromCache(hit.route);
+
+  // b2. runtime disk cache, then committed recordings
+  const disk = await readRouteFile(path.join(routeCacheDir(), `${safeId(id)}.json`));
+  if (disk) {
+    routeCache.set(key, { at: Date.now(), ttl: TTL_MS, route: disk });
+    return fromCache(disk);
+  }
+  const recorded = await readRouteFile(path.join(recordedRoutesDir(), `${safeId(id)}.json`));
+  if (recorded) {
+    const suffix = ` · recorded ${recorded.fetchedAt.slice(0, 10)}`;
+    const withSuffix = { ...recorded, attribution: recorded.attribution + suffix };
+    routeCache.set(key, { at: Date.now(), ttl: TTL_MS, route: withSuffix });
+    return fromCache(withSuffix);
   }
 
   // c. OSRM
@@ -377,24 +445,26 @@ export async function resolveRoute(
   if (coords.length < 2) throw new RouteUnavailableError(`Route between "${origin.label}" and "${destination.label}" is degenerate (origin and destination coincide)`);
   const cum = cumulativeKm(coords);
   const distanceKm = +cum[cum.length - 1].toFixed(2);
-  const id = `osrm-${hash(key)}`;
 
-  // e. exits (Overpass corridor → OSRM off-ramp fallback)
+  // e. exits (Overpass corridor union, retried once → OSRM ramp-step fallback)
   let exits: RouteExit[] = [];
-  let exitSource: string;
-  try {
-    const boxes = corridorBoxes(coords);
-    const query = `[out:json][timeout:60];(${boxes.map(([s, w, n, e]) => `node["highway"="motorway_junction"](${s},${w},${n},${e});`).join("")});out body;`;
-    const res = await overpassQuery(query, { cacheKey: `route-exits:${key}`, sessionId: opts.sessionId, timeoutMs: 30000, fetchImpl: opts.fetchImpl });
-    exits = exitsFromJunctions(fullCoords, res.elements, distanceKm);
-    exitSource = "Overpass motorway_junction";
-  } catch (err) {
-    console.warn(`[routing] overpass exits failed: ${(err as Error).message}`);
-    exitSource = "";
+  let overpassOk = false;
+  const boxes = corridorBoxes(coords);
+  const query = `[out:json][timeout:60];(${boxes.map(([s, w, n, e]) => `node["highway"="motorway_junction"](${s},${w},${n},${e});`).join("")});out body;`;
+  for (let attempt = 1; attempt <= 2 && !overpassOk; attempt++) {
+    try {
+      const res = await overpassQuery(query, { cacheKey: `route-exits:${key}`, sessionId: opts.sessionId, timeoutMs: 30000, fetchImpl: opts.fetchImpl });
+      exits = exitsFromJunctions(fullCoords, res.elements, distanceKm);
+      overpassOk = true;
+    } catch (err) {
+      console.warn(`[routing] overpass exits failed (attempt ${attempt}/2): ${(err as Error).message}`);
+    }
   }
-  if (exits.length === 0) {
+  let exitSource = "Overpass motorway_junction";
+  const degraded = exits.length === 0;
+  if (degraded) {
     exits = exitsFromOsrmSteps(fullCoords, osrmRoute, distanceKm);
-    exitSource = exitSource ? "OSRM off-ramp maneuvers (Overpass returned no junctions)" : "OSRM off-ramp maneuvers (Overpass unavailable)";
+    exitSource = overpassOk ? "OSRM ramp steps (no OSM junctions found)" : "OSRM ramp steps (OSM junctions unavailable)";
   }
 
   // f. timezone
@@ -414,8 +484,9 @@ export async function resolveRoute(
     fetchedAt: new Date().toISOString(),
     attribution: `${OSM_ATTRIBUTION}. Geometry: OSRM demo server; exits: ${exitSource}.`
   });
-  routeCache.set(key, { at: Date.now(), route });
+  routeCache.set(key, { at: Date.now(), ttl: degraded ? DEGRADED_TTL_MS : TTL_MS, route });
   storeRoute(route);
+  if (!degraded) await persistRoute(route);
   return route;
 }
 

@@ -1,6 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetBudgets } from "@/lib/providers/budget";
-import { clearOverpassCache } from "@/lib/providers/overpass";
+import { clearOverpassCache, OVERPASS_ENDPOINTS } from "@/lib/providers/overpass";
 import { clearGeocodeCache, reverseGeocode, searchPlaces } from "@/lib/providers/geocode";
 import {
   clearRoutingCache,
@@ -10,7 +13,10 @@ import {
   routeModelFor,
   RouteUnavailableError,
   simplifyRoute,
-  exitsFromJunctions
+  exitsFromJunctions,
+  recordRoute,
+  routeCacheDir,
+  recordedRoutesDir
 } from "@/lib/providers/routing";
 import { tripRouteSchema, type PlaceRef } from "@/lib/trip/types";
 
@@ -81,12 +87,27 @@ function mockFetch(handlers: { osrm?: () => Response; overpass?: () => Response;
   }) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
 }
 
+let tmpRoot = "";
 beforeEach(() => {
+  tmpRoot = mkdtempSync(path.join(os.tmpdir(), "uncongest-routing-"));
+  process.env.UNCONGEST_CACHE_DIR = path.join(tmpRoot, "cache");
+  process.env.UNCONGEST_RECORDED_DIR = path.join(tmpRoot, "recorded");
   resetBudgets();
   clearOverpassCache();
   clearRoutingCache();
   clearGeocodeCache();
 });
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  delete process.env.UNCONGEST_CACHE_DIR;
+  delete process.env.UNCONGEST_RECORDED_DIR;
+  rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+const noNetwork = vi.fn(async () => {
+  throw new Error("network must not be used");
+}) as unknown as typeof fetch;
 
 describe("resolveRoute", () => {
   it("short-circuits Toronto → Montréal to the offline fixture", async () => {
@@ -129,19 +150,23 @@ describe("resolveRoute", () => {
     expect(getStoredRoute(r.id)).toBeDefined();
   });
 
-  it("falls back to OSRM off-ramp maneuvers when Overpass fails", async () => {
+  it("retries Overpass once, then falls back to OSRM ramp steps", async () => {
     const f = mockFetch({ overpass: () => json({ error: "busy" }, 504) });
     const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f });
     expect(r.exits.map((e) => e.ref)).toEqual(["12A", "30"]);
     expect(r.exits[0].exitTo).toBe("Main St, Springfield");
-    expect(r.attribution).toContain("OSRM off-ramp");
+    expect(r.attribution).toContain("OSRM ramp steps (OSM junctions unavailable)");
+    // 2 attempts × (primary + mirrors)
+    expect(f.mock.calls.filter(([u]) => String(u).includes("interpreter"))).toHaveLength(2 * OVERPASS_ENDPOINTS.length);
+    // degraded routes are never persisted to disk
+    expect(existsSync(path.join(routeCacheDir(), `${r.id}.json`))).toBe(false);
   });
 
   it("falls back to OSRM maneuvers when Overpass returns nothing", async () => {
     const f = mockFetch({ overpass: () => json({ elements: [] }) });
     const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f });
     expect(r.exits).toHaveLength(2);
-    expect(r.attribution).toContain("no junctions");
+    expect(r.attribution).toContain("OSRM ramp steps (no OSM junctions found)");
   });
 
   it("projects junctions against the full geometry (kept near a curve the simplified line cuts)", async () => {
@@ -161,6 +186,71 @@ describe("resolveRoute", () => {
     expect(r.exits.map((e) => e.ref)).toEqual(["5"]);
     expect(r.exits[0].km).toBeCloseTo(r.distanceKm / 2, 1);
     expect(r.exits[0].km).toBeLessThanOrEqual(r.distanceKm);
+  });
+
+  it("succeeds on the Overpass retry after one failed attempt", async () => {
+    let n = 0;
+    const f = mockFetch({ overpass: () => (++n <= 2 ? json({}, 504) : json(overpassOk())) });
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f });
+    expect(r.exits.map((e) => e.ref)).toEqual(["10A", "25"]);
+    expect(r.attribution).toContain("Overpass motorway_junction");
+  });
+
+  it("caches degraded routes for only 10 minutes, then retries Overpass", async () => {
+    const t0 = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(t0);
+    const bad = mockFetch({ overpass: () => json({}, 504) });
+    const first = await resolveRoute(ORIGIN, DEST, { fetchImpl: bad });
+    expect(first.attribution).toContain("OSM junctions unavailable");
+
+    clock.mockReturnValue(t0 + 9 * 60 * 1000);
+    const cached = await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork });
+    expect(cached.source).toBe("cache");
+
+    clock.mockReturnValue(t0 + 11 * 60 * 1000);
+    const good = mockFetch({});
+    const fresh = await resolveRoute(ORIGIN, DEST, { fetchImpl: good });
+    expect(fresh.source).toBe("osrm");
+    expect(fresh.exits.map((e) => e.ref)).toEqual(["10A", "25"]);
+
+    // healthy routes keep the 24 h TTL
+    clock.mockReturnValue(t0 + 11 * 60 * 1000 + 23 * 60 * 60 * 1000);
+    expect((await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork })).source).toBe("cache");
+  });
+
+  it("persists healthy routes to the disk cache and reads them on a memory miss", async () => {
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: mockFetch({}) });
+    const file = path.join(routeCacheDir(), `${r.id}.json`);
+    expect(existsSync(file)).toBe(true);
+    clearRoutingCache(); // memory only
+    const again = await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork });
+    expect(again.source).toBe("cache");
+    expect(again.id).toBe(r.id);
+    expect(again.exits).toEqual(r.exits);
+    expect(getStoredRoute(r.id)).toBeDefined();
+  });
+
+  it("reads committed recordings (never writes them) with a recorded suffix", async () => {
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: mockFetch({}) });
+    const recFile = await recordRoute(r);
+    expect(recFile).toBe(path.join(recordedRoutesDir(), `${r.id}.json`));
+    unlinkSync(path.join(routeCacheDir(), `${r.id}.json`));
+    clearRoutingCache();
+    const rec = await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork });
+    expect(rec.source).toBe("cache");
+    expect(rec.attribution).toContain(` · recorded ${r.fetchedAt.slice(0, 10)}`);
+    expect(existsSync(path.join(routeCacheDir(), `${r.id}.json`))).toBe(false);
+  });
+
+  it("tolerates an unwritable / unreadable cache dir", async () => {
+    const blocker = path.join(tmpRoot, "not-a-dir");
+    writeFileSync(blocker, "x");
+    process.env.UNCONGEST_CACHE_DIR = blocker; // mkdir/read under a file → ENOTDIR
+    process.env.UNCONGEST_RECORDED_DIR = path.join(blocker, "recorded");
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: mockFetch({}) });
+    expect(r.source).toBe("osrm");
+    expect(r.exits).toHaveLength(2);
   });
 
   it("throws RouteUnavailableError on OSRM NoRoute", async () => {

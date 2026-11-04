@@ -12,8 +12,8 @@ export interface RoadAheadWaypoint {
 }
 
 export interface RoadAheadProps {
-  lead: SimCarState;
-  cars: SimCarState[];
+  lead: Pick<SimCarState, "id" | "label" | "progressKm" | "speedKph">;
+  cars: Array<Pick<SimCarState, "id" | "label" | "progressKm" | "positionUpdatedMinutesAgo">>;
   stops: StopCandidate[];
   exits: RouteExit[];
   recommendedStopIds: string[];
@@ -133,7 +133,7 @@ export default function RoadAhead(p: RoadAheadProps) {
             const fill = approved ? "#0d9488" : rankIdx >= 0 ? "#14b8a6" : excluded || passed ? "#cbd5e1" : s.categories.includes("meal") ? "#f59e0b" : "#64748b";
             return (
               <g key={s.id} onClick={() => p.onSelectStop(s.id)} style={{ cursor: "pointer" }}>
-                <title>{`${s.name} — ${s.exitLabel ?? s.exitId}, km ${s.distanceAlongRouteKm}, ${s.categories.join(", ")} (fictional)`}</title>
+                <title>{`${s.name} — ${s.exitLabel ?? s.exitId}, km ${Math.round(s.distanceAlongRouteKm)}, ${s.categories.join(", ")} (${s.isMock ? "fictional" : "real place, OSM"})`}</title>
                 <line x1={x(s.distanceAlongRouteKm)} x2={x(s.distanceAlongRouteKm)} y1={38} y2={64} stroke={fill} strokeWidth={1.5} />
                 <circle cx={x(s.distanceAlongRouteKm)} cy={32} r={rankIdx >= 0 || approved ? 9 : 6} fill={fill} stroke="white" strokeWidth={1.5} />
                 {(rankIdx >= 0 || approved) && (

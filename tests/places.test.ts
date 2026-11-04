@@ -12,8 +12,9 @@ import {
   chargersFromTags,
   accessMinutesFor
 } from "@/lib/providers/osmPlaces";
-import { clearTomTomCache, verifyWithTomTom } from "@/lib/providers/tomtom";
-import { RoutePlaceProvider, windowsForDecision } from "@/lib/providers/routePlaces";
+import { clearTomTomCache, searchAlongRouteTomTom, verifyWithTomTom } from "@/lib/providers/tomtom";
+import { getBudget } from "@/lib/providers/budget";
+import { RoutePlaceProvider, prefetchWindows, windowsForDecision } from "@/lib/providers/routePlaces";
 import { evaluateCandidates } from "@/lib/domain/engine";
 import type { CarState, CollectiveIntent, Environment, StopCandidate, TripConfig, TripContext } from "@/lib/domain/types";
 
@@ -217,7 +218,7 @@ describe("discoverOsmPlaces", () => {
     const stops = await provider.getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] });
     expect(stops).toHaveLength(3);
     expect(provider.name).toBe("osm-places");
-    expect(provider.trace.join("\n")).toMatch(/3 element\(s\) \(live\)/);
+    expect(provider.trace.join("\n")).toMatch(/tile km \d+–\d+: \d+ place\(s\), live/);
 
     const cars: CarState[] = [
       { id: "a", label: "A", role: "lead", progressKm: 0, speedKph: 100, passengers: 2, kids: false, ev: false, positionUpdatedMinutesAgo: 0, needs: ["meal"] },
@@ -331,5 +332,131 @@ describe("TomTom verifier", () => {
     const r = await verifyWithTomTom(cand("Nowhere", "node/9"), { fetchImpl: f as unknown as typeof fetch });
     expect(r.status).toBe("not_found");
     expect(r.patch).toBeUndefined();
+  });
+});
+
+describe("TomTom along-route fallback", () => {
+  const ttResults = [
+    {
+      id: "tt-1",
+      detourTime: 240,
+      position: { lat: LAT + 0.004, lon: lngAt(30) },
+      poi: {
+        name: "Tim Hortons",
+        brands: [{ name: "Tim Hortons" }],
+        categorySet: [{ id: 9376002 }],
+        categories: ["café", "café/pub"],
+        classifications: [{ code: "CAFE_PUB", names: [{ name: "café" }] }],
+        openingHours: { mode: "nextSevenDays", timeRanges: [{ startTime: { date: "2026-11-03", hour: 5, minute: 0 }, endTime: { date: "2026-11-03", hour: 23, minute: 0 } }] }
+      }
+    },
+    {
+      id: "tt-2",
+      detourTime: 420,
+      position: { lat: LAT + 0.01, lon: lngAt(50) },
+      poi: { name: "Big Steer", categorySet: [{ id: 7315 }], categories: ["restaurant", "steak house"], classifications: [{ code: "RESTAURANT", names: [{ name: "steak house" }] }] }
+    },
+    {
+      id: "tt-3",
+      detourTime: 60,
+      position: { lat: LAT + 0.001, lon: lngAt(40) },
+      poi: { name: "Rest Area Km 40", categorySet: [{ id: 7395 }], classifications: [{ code: "REST_AREA" }] }
+    }
+  ];
+  /** Overpass always fails (504) or returns `osm`; TomTom returns ttResults. */
+  function routerFetch(osm: OverpassElement[] | "fail") {
+    const tomtomCalls: Array<{ url: string; init?: RequestInit }> = [];
+    const osmCalls: string[] = [];
+    const fn = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("api.tomtom.com")) {
+        tomtomCalls.push({ url: u, init });
+        return new Response(JSON.stringify({ results: ttResults }), { status: 200 });
+      }
+      osmCalls.push(u);
+      if (osm === "fail") return new Response("busy", { status: 504 });
+      return new Response(JSON.stringify({ elements: osm }), { status: 200 });
+    });
+    return { fn: fn as unknown as typeof fetch, tomtomCalls, osmCalls };
+  }
+  const enable = () => {
+    process.env.TOMTOM_LIVE = "1";
+    process.env.TOMTOM_API_KEY = "test";
+    resetBudgets();
+  };
+
+  it("disabled (default): no TomTom fetch, trace says skipped", async () => {
+    const f = routerFetch("fail");
+    const provider = new RoutePlaceProvider(route, { fetchImpl: f.fn });
+    const stops = await provider.getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] });
+    expect(stops).toEqual([]);
+    expect(f.osmCalls.length).toBeGreaterThan(0);
+    expect(f.tomtomCalls).toHaveLength(0);
+    expect(provider.trace.join("\n")).toMatch(/tomtom along-route fallback skipped: disabled/);
+    const direct = await searchAlongRouteTomTom(route, { minKm: 25, maxKm: 55 }, ["meal"], { fetchImpl: f.fn });
+    expect(direct.status).toBe("skipped");
+    expect(f.tomtomCalls).toHaveLength(0);
+  });
+
+  it("enabled: one POST with route points, maps results, cache hit spends nothing", async () => {
+    enable();
+    const f = routerFetch([]);
+    const res = await searchAlongRouteTomTom(route, { minKm: 25, maxKm: 55 }, ["meal", "coffee", "restroom"], { fetchImpl: f.fn, sessionId: "s" });
+    expect(res.status).toBe("ok");
+    expect(f.tomtomCalls).toHaveLength(1);
+    const call = f.tomtomCalls[0];
+    expect(call.init?.method).toBe("POST");
+    expect(call.url).toContain("/search/2/searchAlongRoute/");
+    expect(call.url).toContain("maxDetourTime=600");
+    expect(call.url).toContain("limit=20");
+    expect(call.url).toMatch(/categorySet=[\d,]+/);
+    const body = JSON.parse(String(call.init?.body)) as { route: { points: Array<{ lat: number; lon: number }> } };
+    expect(body.route.points.length).toBeGreaterThanOrEqual(2);
+    expect(body.route.points.length).toBeLessThanOrEqual(150);
+    expect(body.route.points[0].lat).toBe(LAT);
+    expect(body.route.points[0].lon).toBeCloseTo(lngAt(25), 2);
+
+    const byName = (n: string) => res.candidates.find((c) => c.name === n)!;
+    const tim = byName("Tim Hortons");
+    expect(tim).toMatchObject({ source: "tomtom", isMock: false, provenance: "live", categories: ["coffee"], accessMinutes: 4, hoursVerified: true, opensLocal: "05:00", closesLocal: "23:00", restroomsVerified: null, brand: "Tim Hortons", exitLabel: "Exit 30 (Town 30)", distanceAlongRouteKm: 30 });
+    const steer = byName("Big Steer");
+    expect(steer).toMatchObject({ categories: ["meal"], vegOptions: "poor", accessMinutes: 7, hoursVerified: false, open24h: false });
+    const rest = byName("Rest Area Km 40");
+    expect(rest).toMatchObject({ categories: ["restroom"], restroomsVerified: null, accessMinutes: 2, type: "rest-area" });
+    expect(getBudget("tomtom").usage("s").usedThisSession).toBe(1);
+
+    const again = await searchAlongRouteTomTom(route, { minKm: 25, maxKm: 55 }, ["restroom", "coffee", "meal"], { fetchImpl: f.fn, sessionId: "s" });
+    expect(again.provenance).toBe("cached");
+    expect(again.candidates).toHaveLength(3);
+    expect(f.tomtomCalls).toHaveLength(1);
+    expect(getBudget("tomtom").usage("s").usedThisSession).toBe(1);
+    expect(getBudget("tomtom").usage("s").cacheHits).toBe(1);
+  });
+
+  it("fallback only triggers when every OSM tile failed", async () => {
+    enable();
+    const ok = routerFetch([]); // OSM works, just 0 places
+    const p1 = new RoutePlaceProvider(route, { fetchImpl: ok.fn });
+    expect(await p1.getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] })).toEqual([]);
+    expect(ok.tomtomCalls).toHaveLength(0);
+    expect(p1.name).toBe("osm-places");
+
+    clearOverpassCache();
+    const bad = routerFetch("fail");
+    const p2 = new RoutePlaceProvider(route, { fetchImpl: bad.fn });
+    const stops = await p2.getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] });
+    expect(bad.tomtomCalls).toHaveLength(1);
+    expect(stops.map((s) => s.name)).toEqual(["Big Steer"]); // only meal-relevant
+    expect(p2.name).toBe("osm-places+tomtom");
+    expect(p2.trace.join("\n")).toMatch(/tomtom along-route fallback: 1 place/);
+  });
+
+  it("prefetchWindows falls back per failed window", async () => {
+    enable();
+    const bad = routerFetch("fail");
+    const res = await prefetchWindows(route, [{ minKm: 25, maxKm: 55 }], { fetchImpl: bad.fn });
+    expect(bad.tomtomCalls).toHaveLength(1);
+    expect(res.candidates.length).toBe(3);
+    expect(res.trace.join("\n")).toMatch(/tomtom along-route fallback: 3 place/);
   });
 });

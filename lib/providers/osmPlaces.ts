@@ -216,6 +216,32 @@ export interface PlaceElement {
   tags?: Tags;
 }
 
+export interface RouteAnchor {
+  distanceAlongRouteKm: number;
+  offRouteKm: number;
+  exitId: string;
+  exitLabel: string;
+  exitKm: number;
+}
+
+/**
+ * Place a lat/lng on the route: projected km, off-route km, nearest exit (or synthetic
+ * `km-N` / "Near km N" when the route has no exits). distanceAlongRouteKm snaps to the exit km
+ * when the projection is within 3 km of it. Shared by OSM and TomTom mapping.
+ */
+export function anchorOnRoute(route: RouteModel, lat: number, lng: number): RouteAnchor {
+  const { km, offRouteKm } = route.nearestKm(lat, lng);
+  const exit: RouteExit | null = route.nearestExit(km);
+  const useExit = exit !== null && Math.abs(exit.km - km) <= 3;
+  return {
+    distanceAlongRouteKm: Math.round((useExit ? exit!.km : km) * 100) / 100,
+    offRouteKm: Math.round(offRouteKm * 100) / 100,
+    exitId: exit ? exit.id : `km-${Math.round(km)}`,
+    exitLabel: exit ? exitLabel(exit) : `Near km ${Math.round(km)}`,
+    exitKm: exit ? exit.km : Math.round(km * 10) / 10
+  };
+}
+
 /** Map one Overpass element to a StopCandidate (null = skip). */
 export function elementToCandidate(
   el: PlaceElement,
@@ -233,10 +259,8 @@ export function elementToCandidate(
   const finalName = tags.name ?? tags["name:en"] ?? evName ?? kind.unnamedLabel;
   if (!finalName) return null;
 
-  const { km, offRouteKm } = route.nearestKm(lat, lng);
-  const exit: RouteExit | null = route.nearestExit(km);
-  const useExit = exit !== null && Math.abs(exit.km - km) <= 3;
-  const distanceAlongRouteKm = Math.round((useExit ? exit!.km : km) * 100) / 100;
+  const anchor = anchorOnRoute(route, lat, lng);
+  const offRouteKm = anchor.offRouteKm;
   const hours = parseOpeningHours(tags.opening_hours);
   const veg = vegOptionsFromTags(tags);
   const dietary = dietaryFromTags(tags);
@@ -249,10 +273,10 @@ export function elementToCandidate(
     type: kind.type,
     categories: kind.categories,
     region: "",
-    exitId: exit ? exit.id : `km-${Math.round(km)}`,
-    exitLabel: exit ? exitLabel(exit) : `Near km ${Math.round(km)}`,
-    exitKm: exit ? exit.km : Math.round(km * 10) / 10,
-    distanceAlongRouteKm,
+    exitId: anchor.exitId,
+    exitLabel: anchor.exitLabel,
+    exitKm: anchor.exitKm,
+    distanceAlongRouteKm: anchor.distanceAlongRouteKm,
     lat,
     lng,
     isMock: false,
@@ -262,7 +286,7 @@ export function elementToCandidate(
     osmId,
     brand: tags.brand ?? tags.name,
     hoursVerified: hours.hoursVerified,
-    offRouteKm: Math.round(offRouteKm * 100) / 100,
+    offRouteKm,
     vegetarianVerified: dietary.includes("vegetarian") || dietary.includes("vegan") ? true : null,
     restroomsVerified: kind.restroomsVerified,
     parkingVerified: null,

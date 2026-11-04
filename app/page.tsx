@@ -14,10 +14,16 @@ export default function Landing() {
       </p>
       <div className="mt-8 flex flex-col gap-3 sm:flex-row">
         <Link
-          href="/simulate"
+          href="/trip"
           className="focus-ring rounded-lg bg-teal px-6 py-3 font-semibold text-white shadow hover:bg-teal/90"
         >
-          Try the Highway 401 simulation
+          Plan & simulate your own trip
+        </Link>
+        <Link
+          href="/simulate"
+          className="focus-ring rounded-lg border border-navy/20 bg-white px-6 py-3 font-semibold text-navy hover:bg-slate-50"
+        >
+          Highway 401 demo
         </Link>
         <Link
           href="/simulate?demo=1"

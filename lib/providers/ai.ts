@@ -247,6 +247,9 @@ export interface DecisionContext {
   exploration?: string[];
   weatherAtArrival?: Record<string, WeatherSnapshot>;
   weatherAtCars?: WeatherSnapshot[];
+  /** Relevance-filtered trip context (destination, daylight, history) from lib/context/builder.ts. */
+  tripContext?: Record<string, unknown>;
+  preferences?: { mood: string[]; mealPreference: string; customMeal?: string };
 }
 
 export interface AiProvider {
@@ -261,6 +264,7 @@ export const DECISION_SYSTEM_PROMPT = [
   "Choose 1–3 stopIds ONLY from `eligible`, or STAY_SILENT if interrupting isn't worth it (allowed only at low urgency).",
   "Use urgency: high → nearest suitable; moderate → compare the next 1–2 exits; low → a better stop or better weather farther ahead may win.",
   "Consider weatherAtArrival, minutesToExit, detour, group wait, unmet needs, children, and the `exploration` notes (e.g. limited facilities ahead).",
+  "Real places come from OpenStreetMap: a gas station, Tim Hortons, Walmart, service plaza, Subway or restaurant can each be right depending on needs and urgency; respect mealPreference (quick_bite vs proper_meal vs coffee). Use tripContext (destination arrival, daylight, home/hotel) only as given.",
   "Vegetarian/vegan is a preference meaning veg-friendly: chains like sandwich shops and plaza food courts (vegOptions \"some\") are acceptable; prefer \"good\"/\"dedicated\" when the trade-off is small. Halal/gluten-free are strict and already enforced.",
   "Never invent places, ratings, wait times, or speeds; never advise speeding, slowing, or sudden lane changes. Fixture businesses are fictional — don't claim otherwise.",
   "Return JSON only, no markdown: {\"action\": \"STAY_SILENT\"|\"PROPOSE_STOP\"|\"ESCALATE_TO_PASSENGER\", \"picks\": [{\"stopId\", \"kind\": \"FASTEST\"|\"BEST_FIT\"|\"ALTERNATIVE\", \"reason\" (≤ 300 chars, mention exit and timing), \"tradeoffs\": [≤ 4 short strings]}], \"speakMessage\" (≤ 140 chars, calm, for the driver)}."
@@ -282,6 +286,8 @@ export function buildDecisionPayload(ctx: DecisionContext): string {
       stopId: e.stop.id,
       name: e.stop.name,
       exit: e.stop.exitLabel ?? e.stop.exitId,
+      dataSource: e.stop.isMock ? "fictional demo fixture" : `real place (${e.stop.source ?? "osm"}), menu/hours ${e.stop.hoursVerified ? "hours verified" : "hours unverified"}`,
+      brand: e.stop.brand,
       kmAheadOfLead: Math.round(e.stop.distanceAlongRouteKm - lead.progressKm),
       minutesToExit: Math.round(e.minutesAheadForLead),
       maxDetourMinutes: Math.round(Math.max(...Object.values(e.detourMinutesByCar))),
@@ -296,7 +302,9 @@ export function buildDecisionPayload(ctx: DecisionContext): string {
         : null
     })),
     exploration: ctx.exploration ?? [],
-    rejectedCount: ctx.rejected.length
+    rejectedCount: ctx.rejected.length,
+    preferences: ctx.preferences,
+    tripContext: ctx.tripContext
   });
 }
 
