@@ -88,6 +88,9 @@ Both use Muse native structured output (`text.format` json_schema strict) + Zod.
 
 **Border crossings:** from OSM `barrier=border_control`; if Overpass is unavailable and origin/destination are in different countries, the crossing is located by ~10 throttled Nominatim country lookups.
 
+### Route alternatives
+`/api/route/alternatives` returns real OSRM alternatives: native ones plus via-point corridors (6 candidates at 45/55/70 % of the route, offset ±clamp(12 % of length, 15–45 km)). An alternative is kept only if it diverges ≥ max(15 km, 15 %) from the main route and is ≤ 1.35× slower; the fastest distinct ones are kept (cached 24 h). The map draws them dashed; **Route options** compares food places in the lunch/dinner window per route (auto-checked when the current route looks thin) and suggests one only on evidence. Nothing reroutes automatically — "Use this route" re-plans from the car's current position, keeping passenger needs.
+
 ### Hosting for friends
 - Keep secrets server-side (`MODEL_API_KEY`/`MUSE_API_KEY`, `TOMTOM_API_KEY`); leave `TOMTOM_LIVE` unset unless you want live TomTom.
 - Set `LLM_MAX_CALLS_PER_10_MIN` (default 30) and conservative Overpass/OSRM/Nominatim limits; budgets are in-memory per server instance.
