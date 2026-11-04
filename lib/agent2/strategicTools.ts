@@ -271,6 +271,23 @@ export function isFoodOrRestroom(p: Pick<CompactPlace, "categories" | "restrooms
   return p.categories.includes("meal") || p.categories.includes("restroom") || p.restroomsVerified === true;
 }
 
+/** Tiles that actually returned data ("prefetch km A–B: N place(s), live|cached"); failed / not-cached tiles are unknown, NOT empty. */
+export function coveredTiles(trace: string[]): KmWindow[] {
+  const out: KmWindow[] = [];
+  for (const t of trace) {
+    const m = /prefetch km (\d+(?:\.\d+)?)–(\d+(?:\.\d+)?): \d+ place\(s\), (live|cached)/.exec(t);
+    if (m) out.push({ minKm: Number(m[1]), maxKm: Number(m[2]) });
+  }
+  return out;
+}
+
+function coverageOf(w: KmWindow, tiles: KmWindow[]): number {
+  const len = Math.max(w.maxKm - w.minKm, 1e-6);
+  let covered = 0;
+  for (const t of tiles) covered += Math.max(0, Math.min(w.maxKm, t.maxKm) - Math.max(w.minKm, t.minKm));
+  return Math.min(1, covered / len);
+}
+
 function provenanceFromTrace(trace: string[]): EvidenceProvenance {
   if (trace.some((t) => /\blive\b/.test(t))) return "live";
   if (trace.some((t) => /\bcached\b/.test(t))) return "cached";
@@ -308,25 +325,32 @@ async function placesInWindowsTool(ctx: ToolContext): Promise<ToolResult<PlacesD
     return { tool: "placesInWindows", summary: "No future windows to search.", provenance: "simulated", data: { searched: [], perWindow: [], gaps: [], candidates: [] } };
   }
   const kmWindows = windows.map((w) => ({ minKm: w.fromKm, maxKm: w.toKm }));
-  const { trace, candidates } = await prefetchWindows(ctx.route, kmWindows, { sessionId: ctx.input.sessionId, fetchImpl: ctx.fetchImpl });
+  // Cache-only so a slow Overpass never eats the Muse budget; a live lookup warms the cache in the background.
+  const { trace, candidates } = await prefetchWindows(ctx.route, kmWindows, { sessionId: ctx.input.sessionId, fetchImpl: ctx.fetchImpl, cacheOnly: !ctx.fetchImpl });
+  if (!ctx.fetchImpl) void prefetchWindows(ctx.route, kmWindows, { sessionId: ctx.input.sessionId }).catch(() => undefined);
   const provenance = provenanceFromTrace(trace);
   const lead = ctx.input.leadKm;
   const places = candidates.filter((c) => c.distanceAlongRouteKm > lead && !c.isMock).map(compactPlace);
+  const tiles = coveredTiles(trace);
   const perWindow = windows.map((w) => {
     const inW = places.filter((p) => p.km >= w.fromKm - 3 && p.km <= w.toKm + 3);
     const counts = Object.fromEntries(NEEDS.map((n) => [n, inW.filter((p) => p.categories.includes(n)).length])) as Record<Need, number>;
-    return { windowId: w.id, fromKm: w.fromKm, toKm: w.toKm, counts };
+    return { windowId: w.id, fromKm: w.fromKm, toKm: w.toKm, counts, coverage: coverageOf({ minKm: w.fromKm, maxKm: w.toKm }, tiles) };
   });
-  // Searched coverage = the tiles actually requested (prefetchWindows searches whole tiles).
-  const searched = provenance === "unavailable" ? [] : kmWindows.map((w) => ({ minKm: Math.max(w.minKm, lead), maxKm: w.maxKm }));
+  // Coverage = tiles that actually returned data. Un-fetched stretches are UNKNOWN, never "no services".
+  const searched = tiles.map((t) => ({ minKm: Math.max(t.minKm, lead), maxKm: t.maxKm })).filter((t) => t.maxKm > t.minKm);
   const gaps = findGaps(searched, places);
-  const summary =
-    provenance === "unavailable"
-      ? `Place lookup unavailable for the future windows (${trace.slice(-1)[0] ?? "no trace"}).`
-      : perWindow
-          .map((p) => `${p.windowId} km ${r0(p.fromKm)}–${r0(p.toKm)}: ${p.counts.meal} meal, ${p.counts.coffee} coffee, ${p.counts.restroom} restroom`)
-          .join("; ") + (gaps.length ? `; gaps ≥ ${GAP_KM} km without food/restroom: ${gaps.map((g) => `km ${r0(g.fromKm)}–${r0(g.toKm)}`).join(", ")}` : "");
-  return { tool: "placesInWindows", summary: clip(summary), provenance, data: { searched, perWindow, gaps, candidates: places } };
+  const anyCovered = searched.length > 0;
+  const summary = !anyCovered
+    ? `Place data for km ${windows.map((w) => `${r0(w.fromKm)}–${r0(w.toKm)}`).join(", ")} not available yet (being fetched in the background) — counts unknown, do NOT assume there are no services.`
+    : perWindow
+        .map((p) =>
+          p.coverage < 0.5
+            ? `${p.windowId} km ${r0(p.fromKm)}–${r0(p.toKm)}: counts unknown (only ${Math.round(p.coverage * 100)}% searched)`
+            : `${p.windowId} km ${r0(p.fromKm)}–${r0(p.toKm)}: ${p.counts.meal} meal, ${p.counts.coffee} coffee, ${p.counts.restroom} restroom${p.coverage < 1 ? ` (${Math.round(p.coverage * 100)}% searched)` : ""}`
+        )
+        .join("; ") + (gaps.length ? `; gaps ≥ ${GAP_KM} km without food/restroom in searched stretches: ${gaps.map((g) => `km ${r0(g.fromKm)}–${r0(g.toKm)}`).join(", ")}` : "");
+  return { tool: "placesInWindows", summary: clip(summary), provenance: anyCovered ? provenance : "unavailable", data: { searched, perWindow, gaps, candidates: places } };
 }
 
 /* ------------------------------------------------------------------ weather */
@@ -454,8 +478,13 @@ async function borderCrossingTool(ctx: ToolContext): Promise<ToolResult<BorderDa
     };
   }
   const windows = ahead.map((b) => ({ minKm: Math.max(b.km - BORDER_RADIUS_KM, ctx.input.leadKm), maxKm: Math.min(b.km + BORDER_RADIUS_KM, ctx.route.totalKm) }));
-  const { trace, candidates } = await prefetchWindows(ctx.route, windows, { sessionId: ctx.input.sessionId, fetchImpl: ctx.fetchImpl });
-  const provenance = provenanceFromTrace(trace);
+  // Cache-only so a slow Overpass never eats the Muse budget; a live lookup warms the cache in the background.
+  const { trace, candidates } = await prefetchWindows(ctx.route, windows, { sessionId: ctx.input.sessionId, fetchImpl: ctx.fetchImpl, cacheOnly: !ctx.fetchImpl });
+  if (!ctx.fetchImpl) void prefetchWindows(ctx.route, windows, { sessionId: ctx.input.sessionId }).catch(() => undefined);
+  const tilesB = coveredTiles(trace);
+  // Counts are only meaningful if both sides of each crossing were actually searched.
+  const bothSidesCovered = ahead.every((b, i) => coverageOf({ minKm: windows[i].minKm, maxKm: b.km }, tilesB) >= 0.6 && coverageOf({ minKm: b.km, maxKm: windows[i].maxKm }, tilesB) >= 0.6);
+  const provenance = bothSidesCovered ? provenanceFromTrace(trace) : "unavailable";
   const places = candidates.filter((c) => c.distanceAlongRouteKm > ctx.input.leadKm && !c.isMock).map(compactPlace).filter(isFoodOrRestroom);
   const crossings = ahead.map((b, i) => {
     const before = places.filter((p) => p.km >= windows[i].minKm && p.km < b.km);
@@ -471,7 +500,7 @@ async function borderCrossingTool(ctx: ToolContext): Promise<ToolResult<BorderDa
   });
   const summary =
     provenance === "unavailable"
-      ? `Border crossing ahead at km ${crossings.map((c) => r0(c.km)).join(", ")}; place counts unavailable.`
+      ? `Border crossing ahead at km ${crossings.map((c) => r0(c.km)).join(", ")}; place data near it not available yet — counts unknown.`
       : crossings.map((c) => `Border ${c.name ?? ""} at km ${r0(c.km)}: ${c.beforeCount} food/restroom place(s) within ${BORDER_RADIUS_KM} km before vs ${c.afterCount} after`).join("; ");
   const keep = new Set(crossings.flatMap((c) => [...c.beforeIds, ...c.afterIds]));
   return { tool: "borderCrossing", summary: clip(summary), provenance, data: { crossings, candidates: places.filter((p) => keep.has(p.id)) } };

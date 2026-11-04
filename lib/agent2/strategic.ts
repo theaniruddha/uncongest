@@ -555,7 +555,8 @@ async function plan(input: StrategicInput, deps: StrategicDeps): Promise<Strateg
   const planCtx: PlanCtx = { input, route, tripRoute, evidence, cruiseSpeedKph };
 
   // ---- ONE Muse structured call ----
-  const deadlineMs = deps.deadlineMs ?? deadlineFromEnv();
+  // Whole-run budget: tools + Muse share it, so Muse gets what the tools left (never < 8 s).
+  const deadlineMs = deps.deadlineMs ?? Math.max(8000, deadlineFromEnv() - (Date.now() - started));
   const muse = deps.muse ?? callMuseStructured;
   const user = JSON.stringify({
     trip: {

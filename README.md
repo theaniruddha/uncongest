@@ -63,6 +63,31 @@ Pick an origin and destination (search, presets, or "Use current location"), dep
 
 **Recordings**: `npx vitest run --config vitest.record.config.ts` records preset routes + their OSM tiles to `data/recorded/` (committed; served as cached data with its date).
 
+### Agent 2 · Strategic and Tactical workflows (in `/trip`)
+Two agents only. **Agent 1** (conversation) emits validated per-car intent patches. **Agent 2** (travel intelligence) runs two Muse workflows over the same deterministic context layer and typed tools — no extra agents:
+
+| | Tactical Decision-Maker | Strategic Planner |
+|---|---|---|
+| Question | "Given current needs, reachable candidates and strategic hints, what should we recommend now?" | "What future stop or route opportunities could materially affect this trip, and what should trigger another look?" |
+| Budget | 5 s hard deadline (`TACTICAL_DEADLINE_MS`), Muse effort `minimal` | 30 s (`STRATEGIC_DEADLINE_MS`), effort `medium`, tools run concurrently (≤ 3, 12 s each) |
+| Data | Already-discovered places only (cache-only), cached weather (1.5 s cap), strategic hints if ready | Future windows, places in windows, weather at waypoints + destination, arrival daylight, OSRM alternatives (no extra call), border crossing before/after counts |
+| Output | `RECOMMEND / SEARCH_FARTHER / STAY_SILENT / NO_SUITABLE_STOP / REPLAN` → validated by the engine → cards | Versioned plan: opportunities (km, time window, real candidate ids, evidence refs, priority, confidence), route decisions, replan triggers, expiry |
+| Failure | Deterministic ranking | Deterministic plan from tool evidence |
+
+Both use Muse native structured output (`text.format` json_schema strict) + Zod. Late results are checked: Tactical results for an old context version, or whose exits the car has since passed, are discarded and re-decided; Strategic plans for an old route/context version are rejected and recomputed. Strategic never blocks the map, playback or Tactical; a newer strategic finding is shown as a "Strategic update" — selected stops are never replaced silently. Simulated time pauses while a watcher-triggered Tactical decision runs.
+
+**Measured (Nov 2026, live Muse `muse-spark-1.3`, this machine):**
+- Startup: map + route + baseline ETA **0.95–1.1 s** after "Plan route" (was **47.2 s** — OSRM 0.75 s + Overpass exits ~46 s blocking). Exits/places/strategic now load in the background.
+- Tactical (12 live requests): p50 **3.0 s**, p95 **5.0 s**, **83 %** within 5 s, 17 % deterministic fallback (deadline). With effort `low` it was 0 % within 5 s.
+- Strategic: Muse ≈ **21.5 s** at effort `medium`; total ≈ 33 s when Overpass is slow (place tool times out at 12 s and the plan says so).
+- Playback: a full short trip at 300× made 1 route, 1 prefetch, 1 strategic, 4 weather and 0 tactical requests.
+
+**Home departure:** after leaving Home, routine reminders are held for the first 30 min (`NEXT_PUBLIC_HOME_QUIET_MIN`); explicit requests, urgent needs, or the last suitable stop before a ≥ 70 km gap still go through. No radius ban.
+
+**Place evidence:** every real place carries evidence levels (verified / possible / unsuitable / unknown) for restroom, accessible restroom and diets, from OSM tags or a small chain table (chain-level "possible", official site root, no menu items). Halal/gluten-free require verified evidence; vegetarian is a preference; unknown is never shown as verified. Gas stations, big-box stores, plazas and bar-and-grills are evaluated, not banned; one place covering several needs (coffee + quick bite) is preferred.
+
+**Border crossings:** from OSM `barrier=border_control`; if Overpass is unavailable and origin/destination are in different countries, the crossing is located by ~10 throttled Nominatim country lookups.
+
 ### Hosting for friends
 - Keep secrets server-side (`MODEL_API_KEY`/`MUSE_API_KEY`, `TOMTOM_API_KEY`); leave `TOMTOM_LIVE` unset unless you want live TomTom.
 - Set `LLM_MAX_CALLS_PER_10_MIN` (default 30) and conservative Overpass/OSRM/Nominatim limits; budgets are in-memory per server instance.

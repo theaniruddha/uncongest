@@ -99,7 +99,8 @@ export async function overpassQuery(
     return { elements: hit.elements, provenance: "cached", fetchedAt: new Date(hit.at).toISOString() };
   }
   const pending = inflight.get(opts.cacheKey);
-  if (pending) return pending;
+  // Cache-only callers never wait on an in-flight live query (that is what makes them fast).
+  if (pending && !opts.cacheOnly) return pending;
   const disk = await readDisk(opts.cacheKey, ttl);
   if (disk) {
     cache.set(opts.cacheKey, { at: disk.entry.at, elements: disk.entry.elements });

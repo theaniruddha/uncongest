@@ -240,7 +240,21 @@ export async function POST(req: Request) {
     toolTrace: trace,
     usage: (getBudget("tomtom"), allUsage(sessionId)),
     dataMode: ctx?.dataMode ?? "demo",
-    tactical: tactical ? { ...((tacticalMeta as TacticalMeta | null) ?? { status: "fallback", provider: "deterministic", ms: 0, detail: "no candidates" }), decision: (tacticalDecision as TacticalDecision | null)?.decision, headline: (tacticalDecision as TacticalDecision | null)?.headline, totalMs: Date.now() - startedAt } : undefined,
+    tactical: tactical
+      ? (() => {
+          const meta = (tacticalMeta as TacticalMeta | null) ?? { status: "fallback" as const, provider: "deterministic", ms: 0, detail: "no validated candidates" };
+          const dec = (tacticalDecision as TacticalDecision | null)?.decision;
+          // Real needs but nothing reachable/known yet → say so (and let the client search farther), never "stay quiet".
+          const noCandidates = eligibleSeen.length === 0 && result.triggerReasons.length > 0 && (result.urgency?.level ?? "none") !== "none";
+          return {
+            ...meta,
+            decision: dec ?? (noCandidates ? "SEARCH_FARTHER" : undefined),
+            detail: noCandidates ? "no suitable place known within reach yet — searching farther" : meta.detail,
+            headline: (tacticalDecision as TacticalDecision | null)?.headline,
+            totalMs: Date.now() - startedAt
+          };
+        })()
+      : undefined,
     decidedFor: { elapsedMinutes: request.trip.elapsedMinutes, leadKm: lead.progressKm, contextVersion: ctx?.contextVersion ?? null }
   });
 }

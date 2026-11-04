@@ -33,7 +33,7 @@ const CANDS = [
   cand("osm-130", 130, ["meal", "restroom"], true),
   cand("osm-170", 170, ["restroom"], true)
 ];
-const prefetchMock = vi.fn(async (_route: unknown, _windows: unknown, _opts?: unknown) => ({ trace: ["prefetch km 60–90: 5 place(s), live"], candidates: CANDS }));
+const prefetchMock = vi.fn(async (_route: unknown, _windows: unknown, _opts?: unknown) => ({ trace: Array.from({ length: 12 }, (_, i) => `prefetch km ${i * 30}–${i * 30 + 30}: 5 place(s), live`), candidates: CANDS }));
 vi.mock("@/lib/providers/routePlaces", async (importOriginal) => {
   const orig = await importOriginal<typeof import("@/lib/providers/routePlaces")>();
   return { ...orig, prefetchWindows: (...a: Parameters<typeof orig.prefetchWindows>) => prefetchMock(a[0], a[1], a[2]) };

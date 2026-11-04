@@ -680,7 +680,8 @@ export default function TripPlanner() {
         setTacticalSamples((x) => [...x.slice(-100), { ms: tac?.totalMs ?? clientMs, status, at: Date.now() }]);
         setTacticalState({ status, ms: clientMs, headline: tac?.headline, decision: tac?.decision, detail: tac?.detail });
         if (tac?.decision === "SEARCH_FARTHER" && plan && model && lead) {
-          const from = lead.progressKm + 60;
+          const known = knownPlaces.some((k) => k.distanceAlongRouteKm > lead.progressKm);
+          const from = lead.progressKm + (known ? 60 : (leadCar.speedKph * NOTICE_MIN) / 60);
           void discover(plan.route, [{ minKm: from, maxKm: Math.min(model.totalKm, from + 60), reason: "Tactical asked to search farther" }], plan.setup, model);
         }
         if (r.recommendedStops?.length) {
@@ -696,7 +697,9 @@ export default function TripPlanner() {
         pushLog(
           r.action === "STAY_SILENT" ? "info" : "agent2",
           r.action === "STAY_SILENT"
-            ? `Agent 2 (${r.provider}) → stay quiet [${r.urgency?.level}]`
+            ? r.tactical?.decision === "SEARCH_FARTHER"
+              ? `Agent 2 (${r.provider}) → no suitable place known yet [${r.urgency?.level}] — searching farther`
+              : `Agent 2 (${r.provider}) → stay quiet [${r.urgency?.level}]`
             : `Agent 2 (${r.provider}) → ${r.recommendations.map((x) => `#${x.rank} ${x.name}`).join(", ")} [${r.urgency?.level} urgency, ${trigger}]`
         );
       } catch (e) {
@@ -1182,7 +1185,11 @@ export default function TripPlanner() {
           {!result && !loading && !error && <p className="mt-1 text-xs text-slate-500">{plan ? "Watching the trip — Agent 2 is called only when a stop decision is useful." : "Plan a trip to start."}</p>}
           {result?.action === "STAY_SILENT" && (
             <p className="mt-1 rounded bg-slate-100 p-2 text-xs text-slate-700" data-testid="stay-silent">
-              {result.triggerReasons.length === 0 ? "No stop needed right now — staying quiet." : `Nothing worth interrupting for yet (${result.urgency?.level} urgency). ${result.rejected.length ? "No reachable place passed the checks." : ""}`}
+              {result.triggerReasons.length === 0
+                ? "No stop needed right now — staying quiet."
+                : result.tactical?.decision === "SEARCH_FARTHER" || (result.urgency && result.urgency.level !== "low" && result.urgency.level !== "none")
+                  ? `No suitable reachable place is known yet for this ${result.urgency?.level}-urgency need — searching the road ahead${discovering ? " (discovering places…)" : ""}. ${result.rejected.length ? `${result.rejected.length} place(s) were checked and didn't fit.` : ""}`
+                  : `Nothing worth interrupting for yet (${result.urgency?.level} urgency).`}
             </p>
           )}
           <div className="mt-2 space-y-2">

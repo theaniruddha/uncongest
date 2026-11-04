@@ -150,7 +150,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R
 export async function prefetchWindows(
   route: RouteModel,
   windows: KmWindow[],
-  opts: { sessionId?: string; fetchImpl?: typeof fetch } = {}
+  opts: { sessionId?: string; fetchImpl?: typeof fetch; cacheOnly?: boolean } = {}
 ): Promise<{ trace: string[]; candidates: StopCandidate[] }> {
   const tiles = new Map<string, KmWindow>();
   for (const w of windows) for (const t of tilesFor(route, w)) tiles.set(`${t.minKm}`, t);
@@ -172,7 +172,7 @@ export async function prefetchWindows(
   // Per window: if every attempted tile failed, try ONE opt-in TomTom along-route search.
   for (const w of windows) {
     const keys = tilesFor(route, w).map((t) => `${t.minKm}`).filter((k) => attempted.has(k));
-    if (keys.length === 0 || !keys.every((k) => failed.has(k))) continue;
+    if (opts.cacheOnly || keys.length === 0 || !keys.every((k) => failed.has(k))) continue;
     const tt = await searchAlongRouteTomTom(route, w, BROAD, opts);
     const label = `prefetch window km ${w.minKm.toFixed(0)}–${w.maxKm.toFixed(0)}`;
     trace.push(...tt.trace.map((t) => `${label} ${t}`), `${label} ${alongRouteTraceLine(tt)}`);
