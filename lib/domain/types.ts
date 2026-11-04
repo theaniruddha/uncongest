@@ -92,6 +92,8 @@ export interface StopCandidate {
   hoursVerified?: boolean;
   /** Straight-line distance from the route to the place, km. */
   offRouteKm?: number;
+  /** Evidence about facilities/diet: verified (explicit data), possible (chain-level / indirect), unsuitable, unknown. */
+  evidence?: PlaceEvidence;
   vegetarianVerified: boolean | null;
   /**
    * How veg-friendly the menu is (meal stops only). Vegetarian/vegan is a preference, not a filter:
@@ -110,6 +112,25 @@ export interface StopCandidate {
   reviewCountMock?: number;
   congestionNoteMock?: string;
   chargers?: ChargerSpec[];
+}
+
+export type EvidenceLevel = "verified" | "possible" | "unsuitable" | "unknown";
+export interface EvidenceItem {
+  level: EvidenceLevel;
+  /** Where it came from: "osm:diet:vegetarian=yes", "chain menu (official site)", "tomtom", … */
+  source: string;
+  note?: string;
+  url?: string;
+}
+export interface PlaceEvidence {
+  restroom?: EvidenceItem;
+  accessibleRestroom?: EvidenceItem;
+  vegetarian?: EvidenceItem;
+  vegan?: EvidenceItem;
+  halal?: EvidenceItem;
+  gluten_free?: EvidenceItem;
+  /** Rough kind of food service, for "quick bite" vs "proper meal" matching. */
+  service?: "quick_service" | "sit_down" | "cafe" | "convenience" | "fuel" | "big_box" | "plaza" | "rest_area" | "other";
 }
 
 export interface RejectionReason {

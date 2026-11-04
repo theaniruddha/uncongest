@@ -78,6 +78,22 @@ export const tripRouteSchema = z.object({
   ),
   distanceKm: z.number().positive(),
   durationMinutes: z.number().positive(),
+  /** Progressive loading: geometry is returned first; exits/borders arrive via /api/route/exits. */
+  exitsStatus: z.enum(["pending", "ready", "degraded"]).default("ready"),
+  /** Border crossings / customs points on the route (OSM barrier=border_control), km along route. */
+  borderCrossings: z.array(z.object({ km: z.number(), name: z.string().nullable(), lat: z.number(), lng: z.number() })).default([]),
+  /** OSRM alternative routes from the same request (no extra call), simplified for comparison only. */
+  alternatives: z
+    .array(
+      z.object({
+        id: z.string(),
+        distanceKm: z.number(),
+        durationMinutes: z.number(),
+        summary: z.string(),
+        coordinates: z.array(z.tuple([z.number(), z.number()]))
+      })
+    )
+    .default([]),
   source: z.enum(["osrm", "cache", "fixture"]),
   /** IANA time zone of the origin (sim clock + weather + daylight). */
   timezone: z.string().default("America/Toronto"),
