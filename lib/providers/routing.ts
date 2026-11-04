@@ -160,6 +160,7 @@ export function exitsFromJunctions(coords: LngLat[], elements: OverpassElement[]
   const raw: RawExit[] = [];
   for (const el of elements) {
     if (el.type !== "node" || el.lat === undefined || el.lon === undefined) continue;
+    if (el.tags?.barrier) continue; // border_control etc. share the query
     const p = projectOnto(coords, cum, el.lat, el.lon);
     if (p.offRouteKm > EXIT_MAX_OFFSET_KM) continue;
     const tags = el.tags ?? {};
@@ -187,7 +188,7 @@ interface OsrmRoute {
   distance: number;
   duration: number;
   geometry: { type: string; coordinates: LngLat[] };
-  legs?: Array<{ steps?: OsrmStep[] }>;
+  legs?: Array<{ summary?: string; steps?: OsrmStep[] }>;
 }
 
 export function exitsFromOsrmSteps(coords: LngLat[], route: OsrmRoute, targetTotalKm?: number): RouteExit[] {
@@ -218,6 +219,40 @@ export function exitsFromOsrmSteps(coords: LngLat[], route: OsrmRoute, targetTot
     }
   }
   return dedupeExits(raw);
+}
+
+export interface BorderCrossing {
+  km: number;
+  name: string | null;
+  lat: number;
+  lng: number;
+}
+
+/** OSM barrier=border_control nodes/ways (center) within 300 m of the route, deduped within 2 km. */
+export function borderCrossingsFrom(coords: LngLat[], elements: OverpassElement[], targetTotalKm?: number): BorderCrossing[] {
+  const cum = cumulativeKm(coords);
+  const scale = kmScaler(cum, targetTotalKm);
+  const raw: BorderCrossing[] = [];
+  for (const el of elements) {
+    if (el.tags?.barrier !== "border_control") continue;
+    const lat = el.lat ?? el.center?.lat;
+    const lng = el.lon ?? el.center?.lon;
+    if (lat === undefined || lng === undefined) continue;
+    const p = projectOnto(coords, cum, lat, lng);
+    if (p.offRouteKm > 0.3) continue;
+    raw.push({ km: +scale(p.km).toFixed(2), name: el.tags.name ?? el.tags.operator ?? null, lat, lng });
+  }
+  raw.sort((a, b) => a.km - b.km);
+  const out: BorderCrossing[] = [];
+  for (const b of raw) {
+    const prev = out[out.length - 1];
+    if (prev && b.km - prev.km < 2) {
+      if (!prev.name && b.name) prev.name = b.name;
+      continue;
+    }
+    out.push(b);
+  }
+  return out;
 }
 
 // ---------- helpers ----------
@@ -350,7 +385,41 @@ export async function recordRoute(route: TripRoute): Promise<string> {
 
 // ---------- resolve ----------
 
+type ExitsMode = "inline" | "defer";
+interface ResolveOpts {
+  sessionId?: string;
+  fetchImpl?: FetchImpl;
+  /** "inline" (default): wait for exits. "defer": return geometry ASAP with exitsStatus "pending". */
+  exits?: ExitsMode;
+}
+
+/** Memory cache keyed by route id (id is a hash of the rounded endpoints). */
 const routeCache = new Map<string, { at: number; ttl: number; route: TripRoute }>();
+/** Full-resolution OSRM polyline + steps per route id (for exit projection), LRU-bounded. */
+const geometryById = new Map<string, { full: LngLat[]; osrm: OsrmRoute }>();
+const geometryInflight = new Map<string, Promise<TripRoute>>();
+const exitsInflight = new Map<string, Promise<TripRoute>>();
+
+function rememberGeometry(id: string, full: LngLat[], osrm: OsrmRoute): void {
+  geometryById.delete(id);
+  geometryById.set(id, { full, osrm });
+  while (geometryById.size > STORE_MAX) {
+    const oldest = geometryById.keys().next().value;
+    if (oldest === undefined) break;
+    geometryById.delete(oldest);
+  }
+}
+
+function freshCached(id: string): TripRoute | null {
+  const hit = routeCache.get(id);
+  return hit && Date.now() - hit.at < hit.ttl ? hit.route : null;
+}
+
+function cacheRoute(route: TripRoute): void {
+  const ttl = route.exitsStatus === "degraded" ? DEGRADED_TTL_MS : TTL_MS;
+  routeCache.set(route.id, { at: Date.now(), ttl, route });
+  storeRoute(route);
+}
 
 function fixtureRoute(origin: PlaceRef, destination: PlaceRef): TripRoute {
   const coords = routeFixture.coordinates as LngLat[];
@@ -363,6 +432,7 @@ function fixtureRoute(origin: PlaceRef, destination: PlaceRef): TripRoute {
     exits: routeFixture.exits,
     distanceKm: +cum[cum.length - 1].toFixed(2),
     durationMinutes: routeFixture.osrmDurationMinutes,
+    exitsStatus: "ready",
     source: "fixture",
     timezone: DEFAULT_TZ,
     fetchedAt: routeFixture.fetchedAt,
@@ -370,61 +440,35 @@ function fixtureRoute(origin: PlaceRef, destination: PlaceRef): TripRoute {
   });
 }
 
-export async function resolveRoute(
-  origin: PlaceRef,
-  destination: PlaceRef,
-  opts: { sessionId?: string; fetchImpl?: FetchImpl } = {}
-): Promise<TripRoute> {
-  // a. offline fixture
-  if (
-    haversineKm([origin.lng, origin.lat], FIXTURE_ORIGIN) <= FIXTURE_RADIUS_KM &&
-    haversineKm([destination.lng, destination.lat], FIXTURE_DEST) <= FIXTURE_RADIUS_KM
-  ) {
-    const r = fixtureRoute(origin, destination);
-    storeRoute(r);
-    return r;
-  }
+const isFixtureTrip = (o: PlaceRef, d: PlaceRef) =>
+  haversineKm([o.lng, o.lat], FIXTURE_ORIGIN) <= FIXTURE_RADIUS_KM && haversineKm([d.lng, d.lat], FIXTURE_DEST) <= FIXTURE_RADIUS_KM;
 
-  const key = endpointKey(origin, destination);
-  const id = `osrm-${hash(key)}`;
+function routeSummary(r: OsrmRoute): string {
+  const s = r.legs?.[0]?.summary?.trim();
+  if (s) return s;
+  const names: string[] = [];
+  for (const step of r.legs?.[0]?.steps ?? []) {
+    const n = (step.ref || step.name || "").trim();
+    if (n && !names.includes(n)) names.push(n);
+    if (names.length >= 3) break;
+  }
+  return names.join(", ") || "Alternative route";
+}
+
+/** OSRM (one request, alternatives=true) + timezone in parallel → route with exitsStatus "pending". */
+async function loadGeometry(origin: PlaceRef, destination: PlaceRef, id: string, opts: ResolveOpts): Promise<TripRoute> {
+  const t0 = Date.now();
   const osrmBudget = getBudget("osrm");
-  const fromCache = (cached: TripRoute, suffix = ""): TripRoute => {
-    osrmBudget.hit();
-    const r: TripRoute = { ...cached, origin, destination, source: "cache", attribution: cached.attribution + suffix };
-    storeRoute(r);
-    return r;
-  };
-
-  // b. memory cache
-  const hit = routeCache.get(key);
-  if (hit && Date.now() - hit.at < hit.ttl) return fromCache(hit.route);
-
-  // b2. runtime disk cache, then committed recordings
-  const disk = await readRouteFile(path.join(routeCacheDir(), `${safeId(id)}.json`));
-  if (disk) {
-    routeCache.set(key, { at: Date.now(), ttl: TTL_MS, route: disk });
-    return fromCache(disk);
-  }
-  const recorded = await readRouteFile(path.join(recordedRoutesDir(), `${safeId(id)}.json`));
-  if (recorded) {
-    const suffix = ` · recorded ${recorded.fetchedAt.slice(0, 10)}`;
-    const withSuffix = { ...recorded, attribution: recorded.attribution + suffix };
-    routeCache.set(key, { at: Date.now(), ttl: TTL_MS, route: withSuffix });
-    return fromCache(withSuffix);
-  }
-
-  // c. OSRM
   const refused = osrmBudget.take(opts.sessionId);
   if (refused) throw new RoutingServiceUnavailableError(refused);
-  const url = `${OSRM_BASE}/route/v1/driving/${origin.lng.toFixed(5)},${origin.lat.toFixed(5)};${destination.lng.toFixed(5)},${destination.lat.toFixed(5)}?overview=full&geometries=geojson&steps=true`;
-  let resp: { status: number; ok: boolean; json: unknown };
-  try {
-    resp = await fetchJson(url, OSRM_TIMEOUT_MS, opts.fetchImpl);
-  } catch (err) {
-    const msg = (err as Error).name === "AbortError" ? "timeout after 20 s" : (err as Error).message;
+  const url = `${OSRM_BASE}/route/v1/driving/${origin.lng.toFixed(5)},${origin.lat.toFixed(5)};${destination.lng.toFixed(5)},${destination.lat.toFixed(5)}?overview=full&geometries=geojson&steps=true&alternatives=true`;
+  const osrmCall = fetchJson(url, OSRM_TIMEOUT_MS, opts.fetchImpl).catch((err: Error) => {
+    const msg = err.name === "AbortError" ? "timeout after 20 s" : err.message;
     osrmBudget.error(msg);
     throw new RoutingServiceUnavailableError(`Routing service (OSRM) unavailable: ${msg}`);
-  }
+  });
+  const [resp, timezone] = await Promise.all([osrmCall, lookupTimezone(origin, opts.sessionId, opts.fetchImpl)]);
+
   const body = resp.json as { code?: string; message?: string; routes?: OsrmRoute[] } | null;
   if (!body || typeof body.code !== "string") {
     osrmBudget.error(`http ${resp.status}`);
@@ -437,61 +481,187 @@ export async function resolveRoute(
     );
   }
 
-  // d. simplify (keep the full line for exit projection)
-  const fullCoords = osrmRoute.geometry.coordinates.filter(
-    (c, i, arr) => i === 0 || c[0] !== arr[i - 1][0] || c[1] !== arr[i - 1][1]
-  );
+  const fullCoords = osrmRoute.geometry.coordinates.filter((c, i, arr) => i === 0 || c[0] !== arr[i - 1][0] || c[1] !== arr[i - 1][1]);
   const coords = simplifyRoute(osrmRoute.geometry.coordinates);
   if (coords.length < 2) throw new RouteUnavailableError(`Route between "${origin.label}" and "${destination.label}" is degenerate (origin and destination coincide)`);
   const cum = cumulativeKm(coords);
-  const distanceKm = +cum[cum.length - 1].toFixed(2);
 
-  // e. exits (Overpass corridor union, retried once → OSRM ramp-step fallback)
-  let exits: RouteExit[] = [];
-  let overpassOk = false;
-  const boxes = corridorBoxes(coords);
-  const query = `[out:json][timeout:60];(${boxes.map(([s, w, n, e]) => `node["highway"="motorway_junction"](${s},${w},${n},${e});`).join("")});out body;`;
-  for (let attempt = 1; attempt <= 2 && !overpassOk; attempt++) {
-    try {
-      const res = await overpassQuery(query, { cacheKey: `route-exits:${key}`, sessionId: opts.sessionId, timeoutMs: 30000, fetchImpl: opts.fetchImpl });
-      exits = exitsFromJunctions(fullCoords, res.elements, distanceKm);
-      overpassOk = true;
-    } catch (err) {
-      console.warn(`[routing] overpass exits failed (attempt ${attempt}/2): ${(err as Error).message}`);
-    }
-  }
-  let exitSource = "Overpass motorway_junction";
-  const degraded = exits.length === 0;
-  if (degraded) {
-    exits = exitsFromOsrmSteps(fullCoords, osrmRoute, distanceKm);
-    exitSource = overpassOk ? "OSRM ramp steps (no OSM junctions found)" : "OSRM ramp steps (OSM junctions unavailable)";
-  }
+  const alternatives = (body.routes ?? [])
+    .slice(1, 3)
+    .filter((r) => r.geometry?.coordinates?.length >= 2)
+    .map((r, i) => ({
+      id: `${id}-alt${i + 1}`,
+      distanceKm: +(r.distance / 1000).toFixed(2),
+      durationMinutes: +(r.duration / 60).toFixed(1),
+      summary: routeSummary(r),
+      coordinates: simplifyRoute(r.geometry.coordinates, SIMPLIFY_TOLERANCE_KM, 300)
+    }));
 
-  // f. timezone
-  const timezone = await lookupTimezone(origin, opts.sessionId, opts.fetchImpl);
-
-  // g. assemble
   const route = tripRouteSchema.parse({
     id,
     origin,
     destination,
     coordinates: coords,
-    exits,
-    distanceKm,
+    exits: [],
+    distanceKm: +cum[cum.length - 1].toFixed(2),
     durationMinutes: Math.max(+(osrmRoute.duration / 60).toFixed(1), 0.1),
+    exitsStatus: "pending",
+    borderCrossings: [],
+    alternatives,
     source: "osrm",
     timezone,
     fetchedAt: new Date().toISOString(),
+    attribution: `${OSM_ATTRIBUTION}. Geometry: OSRM demo server; exits: pending.`
+  });
+  rememberGeometry(id, fullCoords, osrmRoute);
+  cacheRoute(route);
+  console.info(`[routing] ${id} geometry ${Date.now() - t0}ms`);
+  return route;
+}
+
+/** Overpass (junctions + border_control in one union, retried once) → OSRM ramp-step fallback. */
+async function computeExits(base: TripRoute, opts: ResolveOpts): Promise<TripRoute> {
+  const t0 = Date.now();
+  const geo = geometryById.get(base.id);
+  const full = geo?.full ?? (base.coordinates as LngLat[]);
+  const boxes = corridorBoxes(base.coordinates as LngLat[]);
+  const q = boxes
+    .map(([s, w, n, e]) => {
+      const bb = `(${s},${w},${n},${e})`;
+      return `node["highway"="motorway_junction"]${bb};node["barrier"="border_control"]${bb};way["barrier"="border_control"]${bb};`;
+    })
+    .join("");
+  const query = `[out:json][timeout:60];(${q});out center;`;
+  let elements: OverpassElement[] | null = null;
+  for (let attempt = 1; attempt <= 2 && !elements; attempt++) {
+    try {
+      const res = await overpassQuery(query, { cacheKey: `route-exits-v2:${base.id}`, sessionId: opts.sessionId, timeoutMs: 30000, fetchImpl: opts.fetchImpl });
+      elements = res.elements;
+    } catch (err) {
+      console.warn(`[routing] overpass exits failed (attempt ${attempt}/2): ${(err as Error).message}`);
+    }
+  }
+  let exits = elements ? exitsFromJunctions(full, elements, base.distanceKm) : [];
+  const borderCrossings = elements ? borderCrossingsFrom(full, elements, base.distanceKm) : [];
+  let exitSource = "Overpass motorway_junction";
+  const degraded = exits.length === 0;
+  if (degraded) {
+    exits = geo ? exitsFromOsrmSteps(full, geo.osrm, base.distanceKm) : [];
+    exitSource = elements ? "OSRM ramp steps (no OSM junctions found)" : "OSRM ramp steps (OSM junctions unavailable)";
+  }
+  const route = tripRouteSchema.parse({
+    ...base,
+    exits,
+    borderCrossings,
+    exitsStatus: degraded ? "degraded" : "ready",
     attribution: `${OSM_ATTRIBUTION}. Geometry: OSRM demo server; exits: ${exitSource}.`
   });
-  routeCache.set(key, { at: Date.now(), ttl: degraded ? DEGRADED_TTL_MS : TTL_MS, route });
-  storeRoute(route);
+  cacheRoute(route);
   if (!degraded) await persistRoute(route);
+  console.info(`[routing] ${base.id} exits ${Date.now() - t0}ms (${route.exitsStatus}, ${exits.length} exits, ${borderCrossings.length} border crossings)`);
   return route;
+}
+
+/**
+ * Fill exits + border crossings for a route resolved with exits: "defer".
+ * Concurrent calls for the same id share one in-flight promise. If the id is unknown (evicted / other
+ * instance) and endpoints are given, geometry is re-resolved from them first (cache → OSRM).
+ */
+export async function resolveExits(
+  routeId: string,
+  opts: { sessionId?: string; fetchImpl?: FetchImpl; origin?: PlaceRef; destination?: PlaceRef } = {}
+): Promise<TripRoute> {
+  const relabel = (r: TripRoute): TripRoute =>
+    opts.origin && opts.destination ? { ...r, origin: opts.origin, destination: opts.destination } : r;
+  const fresh = freshCached(routeId);
+  if (fresh && fresh.exitsStatus !== "pending") return relabel(fresh);
+  const pending = exitsInflight.get(routeId);
+  if (pending) return relabel(await pending);
+
+  let base: TripRoute | null = fresh;
+  if (!base) {
+    const stored = getStoredRoute(routeId);
+    // Expired / degraded entry whose full geometry is still in memory: recompute exits without OSRM.
+    if (stored && stored.exitsStatus !== "ready" && geometryById.has(routeId)) base = stored;
+    else if (stored && stored.exitsStatus === "ready" && routeId === routeFixture.id) return relabel(stored);
+  }
+  if (!base) {
+    if (!opts.origin || !opts.destination) throw new RouteUnavailableError(`Unknown route id "${routeId}" — resolve the route first`);
+    const r = await resolveRoute(opts.origin, opts.destination, { sessionId: opts.sessionId, fetchImpl: opts.fetchImpl, exits: "defer" });
+    if (r.exitsStatus !== "pending") return r;
+    if (r.id !== routeId) return resolveExits(r.id, opts);
+    base = freshCached(r.id) ?? r;
+  }
+  const b = base;
+  const run = computeExits(b, opts);
+  exitsInflight.set(routeId, run);
+  try {
+    return relabel(await run);
+  } finally {
+    exitsInflight.delete(routeId);
+  }
+}
+
+export async function resolveRoute(origin: PlaceRef, destination: PlaceRef, opts: ResolveOpts = {}): Promise<TripRoute> {
+  const mode: ExitsMode = opts.exits ?? "inline";
+  // a. offline fixture
+  if (isFixtureTrip(origin, destination)) {
+    const r = fixtureRoute(origin, destination);
+    storeRoute(r);
+    return r;
+  }
+
+  const key = endpointKey(origin, destination);
+  const id = `osrm-${hash(key)}`;
+  const osrmBudget = getBudget("osrm");
+  const asCached = (cached: TripRoute, suffix = ""): TripRoute => {
+    osrmBudget.hit();
+    const r: TripRoute = { ...cached, origin, destination, source: "cache", attribution: cached.attribution + suffix };
+    storeRoute(r);
+    return r;
+  };
+
+  // b. memory cache (pending routes reuse geometry; inline mode then fills exits)
+  const hit = freshCached(id);
+  if (hit) {
+    if (hit.exitsStatus !== "pending" || mode === "defer") return asCached(hit);
+    return { ...(await resolveExits(id, { sessionId: opts.sessionId, fetchImpl: opts.fetchImpl })), origin, destination, source: "cache" };
+  }
+
+  // b2. runtime disk cache, then committed recordings (always exitsStatus ready)
+  const disk = await readRouteFile(path.join(routeCacheDir(), `${safeId(id)}.json`));
+  if (disk && disk.exitsStatus === "ready") {
+    cacheRoute(disk);
+    return asCached(disk);
+  }
+  const recorded = await readRouteFile(path.join(recordedRoutesDir(), `${safeId(id)}.json`));
+  if (recorded && recorded.exitsStatus === "ready") {
+    const withSuffix = { ...recorded, attribution: `${recorded.attribution} · recorded ${recorded.fetchedAt.slice(0, 10)}` };
+    cacheRoute(withSuffix);
+    return asCached(withSuffix);
+  }
+
+  // c. OSRM geometry (deduped per id)
+  let geom = geometryInflight.get(id);
+  if (!geom) {
+    geom = loadGeometry(origin, destination, id, opts);
+    geometryInflight.set(id, geom);
+    geom.then(
+      () => geometryInflight.delete(id),
+      () => geometryInflight.delete(id)
+    );
+  }
+  const pendingRoute = { ...(await geom), origin, destination };
+  if (mode === "defer") return pendingRoute;
+  const ready = await resolveExits(id, { sessionId: opts.sessionId, fetchImpl: opts.fetchImpl });
+  return { ...ready, origin, destination, source: "osrm" };
 }
 
 /** For tests. */
 export function clearRoutingCache(): void {
   routeCache.clear();
   store.clear();
+  geometryById.clear();
+  geometryInflight.clear();
+  exitsInflight.clear();
 }

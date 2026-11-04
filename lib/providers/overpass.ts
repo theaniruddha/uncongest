@@ -89,7 +89,7 @@ export class OverpassUnavailableError extends Error {}
 
 export async function overpassQuery(
   query: string,
-  opts: { cacheKey: string; ttlMs?: number; sessionId?: string; timeoutMs?: number; fetchImpl?: typeof fetch }
+  opts: { cacheKey: string; ttlMs?: number; sessionId?: string; timeoutMs?: number; fetchImpl?: typeof fetch; cacheOnly?: boolean }
 ): Promise<OverpassResult> {
   const ttl = opts.ttlMs ?? 24 * 60 * 60 * 1000;
   const hit = cache.get(opts.cacheKey);
@@ -106,6 +106,8 @@ export async function overpassQuery(
     budget.hit();
     return { elements: disk.entry.elements, provenance: "cached", fetchedAt: new Date(disk.entry.at).toISOString(), recorded: disk.recorded };
   }
+
+  if (opts.cacheOnly) throw new OverpassUnavailableError("not cached");
 
   const run = (async (): Promise<OverpassResult> => {
     const refused = budget.take(opts.sessionId);

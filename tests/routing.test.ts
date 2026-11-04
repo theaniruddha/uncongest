@@ -16,7 +16,8 @@ import {
   exitsFromJunctions,
   recordRoute,
   routeCacheDir,
-  recordedRoutesDir
+  recordedRoutesDir,
+  resolveExits
 } from "@/lib/providers/routing";
 import { tripRouteSchema, type PlaceRef } from "@/lib/trip/types";
 
@@ -273,6 +274,142 @@ describe("resolveRoute", () => {
     expect(second.source).toBe("cache");
     expect(second.id).toBe(first.id);
     expect(second.origin.label).toBe("Start again");
+  });
+});
+
+describe("progressive loading (exits: defer)", () => {
+  const ALT: LngLat[] = Array.from({ length: 1500 }, (_, i) => [-80 + i * 0.000667, 43 - 0.03 * Math.sin(i / 120)]);
+  function osrmWithAlt() {
+    const o = osrmOk() as ReturnType<typeof osrmOk> & { routes: Array<Record<string, unknown>> };
+    (o.routes[0].legs as Array<Record<string, unknown>>)[0].summary = "Hwy 401, Main St";
+    o.routes.push({
+      distance: 85000,
+      duration: 4200,
+      geometry: { type: "LineString", coordinates: ALT },
+      legs: [{ summary: "QEW, I-190", steps: [] }]
+    });
+    return o;
+  }
+  function overpassWithBorder() {
+    const base = overpassOk();
+    const b1 = at(1000);
+    const b2 = at(1010); // ~0.4 km later → same crossing
+    base.elements.push(
+      { type: "node", id: 50, lat: b1.lat + 0.001, lon: b1.lng, tags: { barrier: "border_control", name: "Peace Bridge Customs" } } as never,
+      { type: "way", id: 51, center: { lat: b2.lat, lon: b2.lng }, tags: { barrier: "border_control" } } as never
+    );
+    return base;
+  }
+  const interpreterCalls = (f: ReturnType<typeof mockFetch>) => f.mock.calls.filter(([u]) => String(u).includes("interpreter")).length;
+  const osrmCalls = (f: ReturnType<typeof mockFetch>) => f.mock.calls.filter(([u]) => String(u).includes("project-osrm")).length;
+
+  it("returns geometry before Overpass is called, then resolveExits fills exits without a second OSRM call", async () => {
+    const f = mockFetch({ osrm: () => json(osrmWithAlt()), overpass: () => json(overpassWithBorder()) });
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f, exits: "defer" });
+    expect(r.exitsStatus).toBe("pending");
+    expect(r.exits).toEqual([]);
+    expect(r.source).toBe("osrm");
+    expect(interpreterCalls(f)).toBe(0);
+    expect(String(f.mock.calls.find(([u]) => String(u).includes("project-osrm"))?.[0])).toContain("alternatives=true");
+    // pending route is reused (no second OSRM)
+    const again = await resolveRoute(ORIGIN, DEST, { fetchImpl: f, exits: "defer" });
+    expect(again.exitsStatus).toBe("pending");
+    expect(osrmCalls(f)).toBe(1);
+
+    const ready = await resolveExits(r.id, { fetchImpl: f });
+    expect(osrmCalls(f)).toBe(1);
+    expect(interpreterCalls(f)).toBe(1);
+    expect(ready.exitsStatus).toBe("ready");
+    expect(ready.exits.map((e) => e.ref)).toEqual(["10A", "25"]);
+    expect(ready.borderCrossings).toHaveLength(1);
+    expect(ready.borderCrossings[0].name).toBe("Peace Bridge Customs");
+    expect(ready.borderCrossings[0].km).toBeGreaterThan(35);
+    expect(ready.borderCrossings[0].km).toBeLessThan(45);
+    expect(() => tripRouteSchema.parse(ready)).not.toThrow();
+    const body = decodeURIComponent(String((f.mock.calls.find(([u]) => String(u).includes("interpreter"))![1] as RequestInit).body).replace(/\+/g, " "));
+    expect(body).toContain('node["barrier"="border_control"]');
+    expect(body).toContain('way["barrier"="border_control"]');
+    expect(body).toContain("out center");
+    // later lookups get the ready route from memory
+    const later = await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork, exits: "defer" });
+    expect(later.exitsStatus).toBe("ready");
+    expect(later.source).toBe("cache");
+  });
+
+  it("runs the timezone lookup concurrently with OSRM", async () => {
+    let meteoStarted!: () => void;
+    const meteoSeen = new Promise<void>((res) => (meteoStarted = res));
+    const order: string[] = [];
+    const f = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("project-osrm")) {
+        order.push("osrm:start");
+        await meteoSeen; // would deadlock if the timezone call waited for OSRM
+        order.push("osrm:end");
+        return json(osrmOk());
+      }
+      if (url.includes("open-meteo")) {
+        order.push("meteo:start");
+        meteoStarted();
+        return json({ timezone: "America/New_York" });
+      }
+      throw new Error(`unexpected ${url}`);
+    }) as unknown as typeof fetch;
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f, exits: "defer" });
+    expect(r.timezone).toBe("America/New_York");
+    expect(order.indexOf("meteo:start")).toBeLessThan(order.indexOf("osrm:end"));
+  });
+
+  it("parses OSRM alternatives (≤ 2, simplified to ≤ 300 points, with summary)", async () => {
+    const f = mockFetch({ osrm: () => json(osrmWithAlt()) });
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f, exits: "defer" });
+    expect(r.alternatives).toHaveLength(1);
+    const alt = r.alternatives[0];
+    expect(alt.id).toBe(`${r.id}-alt1`);
+    expect(alt.summary).toBe("QEW, I-190");
+    expect(alt.distanceKm).toBe(85);
+    expect(alt.durationMinutes).toBe(70);
+    expect(alt.coordinates.length).toBeLessThanOrEqual(300);
+    expect(alt.coordinates.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("de-duplicates concurrent resolveExits calls (one Overpass request)", async () => {
+    const f = mockFetch({ overpass: () => json(overpassWithBorder()) });
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f, exits: "defer" });
+    const [a, b, c] = await Promise.all([resolveExits(r.id, { fetchImpl: f }), resolveExits(r.id, { fetchImpl: f }), resolveExits(r.id, { fetchImpl: f })]);
+    expect(interpreterCalls(f)).toBe(1);
+    expect(a.exits).toEqual(b.exits);
+    expect(c.exitsStatus).toBe("ready");
+  });
+
+  it("marks OSRM-step exits as degraded with the 10-minute TTL", async () => {
+    const f = mockFetch({ overpass: () => json({}, 504) });
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: f, exits: "defer" });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const d = await resolveExits(r.id, { fetchImpl: f });
+    expect(d.exitsStatus).toBe("degraded");
+    expect(d.exits.map((e) => e.ref)).toEqual(["12A", "30"]);
+    expect(d.borderCrossings).toEqual([]);
+  });
+
+  it("returns an already-ready cached route immediately in defer mode", async () => {
+    await resolveRoute(ORIGIN, DEST, { fetchImpl: mockFetch({}) });
+    const r = await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork, exits: "defer" });
+    expect(r.exitsStatus).toBe("ready");
+    expect(r.exits).toHaveLength(2);
+    // also from disk after a memory wipe
+    clearRoutingCache();
+    const d = await resolveRoute(ORIGIN, DEST, { fetchImpl: noNetwork, exits: "defer" });
+    expect(d.exitsStatus).toBe("ready");
+    expect(d.source).toBe("cache");
+  });
+
+  it("resolveExits re-resolves geometry from endpoints when the id is unknown", async () => {
+    await expect(resolveExits("osrm-unknown", {})).rejects.toBeInstanceOf(RouteUnavailableError);
+    const f = mockFetch({});
+    const r = await resolveExits("osrm-whatever", { fetchImpl: f, origin: ORIGIN, destination: DEST });
+    expect(r.exitsStatus).toBe("ready");
+    expect(r.exits.map((e) => e.ref)).toEqual(["10A", "25"]);
   });
 });
 

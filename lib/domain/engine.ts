@@ -82,13 +82,21 @@ export interface DietFit {
 export function dietFit(stop: StopCandidate, diet: Dietary[], needs: Need[]): DietFit {
   if (diet.length === 0 || !needs.includes("meal") || !stop.categories.includes("meal")) return { ok: true, adjust: 0 };
   const strict = diet.filter((d) => STRICT_DIETS.includes(d));
-  if (strict.length && !meetsHardDiet(stop, strict)) {
+  const strictOk = (d: Dietary) => stop.evidence?.[d]?.level === "verified" || meetsHardDiet(stop, [d]);
+  if (strict.length && !strict.every(strictOk)) {
     return { ok: false, reason: `hard dietary requirement (${strict.join(", ")}) not verified`, adjust: 0 };
   }
   const veg = diet.filter((d) => VEG_DIETS.includes(d));
   if (veg.length === 0) return { ok: true, adjust: 0 };
-  const level = vegLevel(stop);
+  // Evidence first (verified / possible / unsuitable / unknown); unknown falls back to the menu heuristic.
   const vegan = veg.includes("vegan");
+  const ev = stop.evidence?.[vegan ? "vegan" : "vegetarian"];
+  if (ev?.level === "unsuitable") return { ok: false, reason: `not ${vegan ? "vegan" : "vegetarian"}-suitable (${ev.source})`, adjust: 0 };
+  if (ev?.level === "verified") return { ok: true, adjust: 0.06, note: `${vegan ? "vegan" : "vegetarian"} options verified (${ev.source})` };
+  if (ev?.level === "possible") {
+    return { ok: true, adjust: vegan ? -0.06 : -0.02, note: `${vegan ? "vegan" : "vegetarian"} options possible — ${ev.source}; not verified for this location` };
+  }
+  const level = vegLevel(stop);
   if (level === "poor") {
     return { ok: false, reason: `not veg-friendly${stop.vegOptionsNote ? `: ${stop.vegOptionsNote}` : " (steakhouse / bar-style menu)"}`, adjust: 0 };
   }
@@ -99,7 +107,13 @@ export function dietFit(stop: StopCandidate, diet: Dietary[], needs: Need[]): Di
       note: `${vegan ? "vegan" : "vegetarian"} options likely but not a veg-focused menu${stop.vegOptionsNote ? ` (${stop.vegOptionsNote})` : ""}`
     };
   }
-  return { ok: true, adjust: level === "dedicated" ? 0.06 : 0.03, note: level === "dedicated" ? "veg-focused menu" : "good vegetarian options" };
+  // Heuristic "good"/"dedicated" without explicit evidence is still unverified.
+  const verifiedSource = stop.isMock || stop.dietaryVerified?.includes("vegetarian") || stop.vegetarianVerified === true;
+  return {
+    ok: true,
+    adjust: level === "dedicated" ? 0.06 : 0.03,
+    note: verifiedSource ? (level === "dedicated" ? "veg-focused menu" : "good vegetarian options") : `vegetarian suitability unverified (${level} by menu type)`
+  };
 }
 
 function chargerCompatible(stop: StopCandidate, cars: CarState[]): boolean {
@@ -151,7 +165,9 @@ export function evaluateCandidates(
         reasons.push(`excluded region: ${config.avoidRegion} per trip config`);
       }
     }
-    if (trip.elapsedMinutes < config.noOptionalStopsFirstMinutes && intent.hungerLevel < 3) {
+    // Early-trip quiet window: only routine/inferred stops are held; explicit or urgent requests always pass.
+    const explicitOrUrgent = intent.need.length > 0 || intent.hungerLevel >= 2 || intent.restroomUrgent === true || trip.overrideInitialQuiet === true;
+    if (trip.elapsedMinutes < config.noOptionalStopsFirstMinutes && !explicitOrUrgent) {
       reasons.push(`within no-optional-stops window (first ${config.noOptionalStopsFirstMinutes} min)`);
     }
 
@@ -221,7 +237,8 @@ export function evaluateCandidates(
       (0.3 * maxDetourNorm +
         0.2 * waitNorm +
         0.2 * qualityPenalty +
-        0.15 * unmetNorm +
+        // One place that covers several needs (e.g. coffee + quick bite) beats a partial match.
+        (urgentNeeds.length > 1 ? 0.35 : 0.15) * unmetNorm +
         0.05 * fatigue +
         0.05 * darkness * maxDetourNorm +
         trafficRisk) +
@@ -508,7 +525,8 @@ export async function exploreNextExits(
     notes.push(`kept with caveats: ${softNoted.map((r) => `${r.stopId} (${r.reasons[0]})`).join("; ")}`);
   }
 
-  const mergedEligible = [...initial.eligible, ...newEligible].sort((a, b) => {
+  const seenIds = new Set(initial.eligible.map((e) => e.stop.id));
+  const mergedEligible = [...initial.eligible, ...newEligible.filter((e) => !seenIds.has(e.stop.id))].sort((a, b) => {
     if (a.tier !== b.tier) return a.tier === "primary" ? -1 : 1;
     return b.score - a.score;
   });
@@ -581,6 +599,23 @@ export function applyHorizon(
     const wider = order[order.indexOf(level) + 1];
     first = pick(wider);
     notes.push(`nothing suitable inside the ${level} horizon; widened once to ${wider} (≤ ${first.h.maxKm} km) → ${first.kept.length} option(s)`);
+  }
+  // Coverage upgrade: a slightly farther stop that covers MORE of the active needs (e.g. coffee + quick
+  // bite in one place) is worth comparing even if it sits just past the exit limit.
+  if (first.kept.length > 0 && level !== "high") {
+    const bestUnmet = Math.min(...first.kept.map((e) => e.scoreBreakdown.unmetNeeds));
+    const lastKm = Math.max(...first.kept.map((e) => e.stop.distanceAlongRouteKm));
+    const upgrades = eligible.filter(
+      (e) =>
+        !first.kept.includes(e) &&
+        e.stop.distanceAlongRouteKm <= lastKm + 20 &&
+        e.stop.distanceAlongRouteKm - leadKm <= first.h.maxKm &&
+        e.scoreBreakdown.unmetNeeds < bestUnmet
+    );
+    if (upgrades.length) {
+      first = { ...first, kept: [...first.kept, ...upgrades] };
+      notes.push(`added ${upgrades.length} slightly farther option(s) that cover more of the needs (${upgrades.map((u) => u.stop.name).join(", ")})`);
+    }
   }
   const deferred = eligible.length - first.kept.length;
   if (deferred > 0) notes.push(`${deferred} eligible option(s) beyond the horizon deferred (not rejected)`);

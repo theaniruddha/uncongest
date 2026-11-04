@@ -10,9 +10,13 @@ import {
   parseOpeningHours,
   vegOptionsFromTags,
   chargersFromTags,
-  accessMinutesFor
+  accessMinutesFor,
+  selectorsFor
 } from "@/lib/providers/osmPlaces";
-import { clearTomTomCache, searchAlongRouteTomTom, verifyWithTomTom } from "@/lib/providers/tomtom";
+import { BRAND_PROFILES, CHAIN_RESTROOM_SOURCE, CHAIN_VEG_SOURCE, matchBrand } from "@/lib/providers/brandEvidence";
+import { readFileSync } from "fs";
+import path from "path";
+import { clearTomTomCache, searchAlongRouteTomTom, tomtomEvidence, verifyWithTomTom } from "@/lib/providers/tomtom";
 import { getBudget } from "@/lib/providers/budget";
 import { RoutePlaceProvider, prefetchWindows, windowsForDecision } from "@/lib/providers/routePlaces";
 import { evaluateCandidates } from "@/lib/domain/engine";
@@ -71,9 +75,13 @@ afterEach(() => {
 });
 
 describe("OSM tag mapping", () => {
-  it("Tim Hortons: cafe with brand", () => {
+  it("Tim Hortons: cafe with brand → coffee + meal + restroom(possible), vegetarian possible from chain", () => {
     const c = elementToCandidate(el({ amenity: "cafe", name: "Tim Hortons", brand: "Tim Hortons", cuisine: "coffee_shop;donut" }), route, meta)!;
-    expect(c.categories).toEqual(["coffee"]);
+    expect([...c.categories].sort()).toEqual(["coffee", "meal", "restroom"]);
+    expect(c.evidence?.restroom).toMatchObject({ level: "possible", source: CHAIN_RESTROOM_SOURCE });
+    expect(c.evidence?.vegetarian).toMatchObject({ level: "possible", source: CHAIN_VEG_SOURCE, url: "https://www.timhortons.ca" });
+    expect(c.evidence?.service).toBe("quick_service");
+    expect(c.evidence?.halal?.level).toBe("unknown");
     expect(c.brand).toBe("Tim Hortons");
     expect(c.type).toBe("cafe");
     expect(c.isMock).toBe(false);
@@ -88,8 +96,12 @@ describe("OSM tag mapping", () => {
 
   it("Subway: fast_food sandwich -> meal, vegOptions some", () => {
     const c = elementToCandidate(el({ amenity: "fast_food", name: "Subway", brand: "Subway", cuisine: "sandwich" }), route, meta)!;
-    expect(c.categories).toEqual(["meal"]);
+    expect([...c.categories].sort()).toEqual(["meal", "restroom"]);
     expect(c.vegOptions).toBe("some");
+    expect(c.evidence?.vegetarian?.level).toBe("possible"); // chain-level, never "verified"
+    expect(c.evidence?.vegetarian?.source).toMatch(/not location-verified/);
+    expect(c.evidence?.restroom?.level).toBe("possible");
+    expect(c.restroomsVerified).toBeNull();
     expect(c.dietaryVerified).toBeUndefined();
   });
 
@@ -195,16 +207,16 @@ describe("discoverOsmPlaces", () => {
     expect(res.query).not.toContain("toilets");
   });
 
-  it("filters to requested needs and caps at 25, ranked by relevance", async () => {
+  it("filters to requested needs and caps at 40, ranked by relevance", async () => {
     const elements: OverpassElement[] = [];
-    for (let i = 0; i < 40; i++) elements.push(el({ amenity: "restaurant", name: `R${i}` }, 30, 0.2 + i * 0.05));
+    for (let i = 0; i < 50; i++) elements.push(el({ amenity: "restaurant", name: `R${i}` }, 30, 0.2 + i * 0.05));
     elements.push(el({ highway: "services", name: "Plaza" }, 50, 1.5));
-    elements.push(el({ shop: "supermarket", name: "Walmart" }, 30)); // grocery not requested
+    elements.push(el({ shop: "supermarket", name: "Local Grocer" }, 30)); // grocery not requested, no restroom evidence
     const f = overpassFetch(elements);
     const res = await discoverOsmPlaces(route, { minKm: 25, maxKm: 55 }, ["meal", "restroom"], { fetchImpl: f.fn });
     expect(res.candidates).toHaveLength(MAX_CANDIDATES);
     expect(res.candidates[0].name).toBe("Plaza"); // serves meal + restroom
-    expect(res.candidates.some((c) => c.name === "Walmart")).toBe(false);
+    expect(res.candidates.some((c) => c.name === "Local Grocer")).toBe(false);
     expect(res.candidates[1].name).toBe("R0"); // closest restaurant next
   });
 
@@ -458,5 +470,117 @@ describe("TomTom along-route fallback", () => {
     expect(bad.tomtomCalls).toHaveLength(1);
     expect(res.candidates.length).toBe(3);
     expect(res.trace.join("\n")).toMatch(/tomtom along-route fallback: 3 place/);
+  });
+});
+
+describe("place evidence", () => {
+  const cand = (tags: Record<string, string>) => elementToCandidate(el(tags), route, meta)!;
+
+  it("explicit diet tag → verified; steakhouse → vegan unsuitable", () => {
+    const v = cand({ amenity: "restaurant", name: "Green Fork", "diet:vegetarian": "yes" });
+    expect(v.evidence?.vegetarian).toEqual({ level: "verified", source: "osm:diet:vegetarian=yes" });
+    expect(v.evidence?.service).toBe("sit_down");
+    const s = cand({ amenity: "restaurant", name: "Big Steer", cuisine: "steak_house" });
+    expect(s.evidence?.vegan?.level).toBe("unsuitable");
+    expect(s.evidence?.vegetarian?.level).toBe("unknown");
+    const no = cand({ amenity: "restaurant", name: "X", "diet:halal": "no" });
+    expect(no.evidence?.halal?.level).toBe("unsuitable");
+  });
+
+  it("cuisine hint → possible, never verified", () => {
+    const c = cand({ amenity: "restaurant", name: "Curry House", cuisine: "indian" });
+    expect(c.evidence?.vegetarian?.level).toBe("possible");
+  });
+
+  it("Petro-Canada with convenience shop → restroom possible; without shop → no restroom", () => {
+    const p = cand({ amenity: "fuel", name: "Petro-Canada", brand: "Petro-Canada", shop: "convenience" });
+    expect(p.evidence?.restroom?.level).toBe("possible");
+    expect(p.categories).toContain("restroom");
+    expect(p.evidence?.service).toBe("fuel");
+    const bare = classifyTags({ amenity: "fuel", name: "Petro-Canada", brand: "Petro-Canada" })!;
+    expect(bare.evidence.restroom?.level).toBe("unknown");
+    expect(bare.categories).not.toContain("restroom");
+  });
+
+  it("amenity=toilets wheelchair=yes → accessible verified; toilets:wheelchair=no → unsuitable", () => {
+    const t = cand({ amenity: "toilets", wheelchair: "yes" });
+    expect(t.evidence?.restroom?.level).toBe("verified");
+    expect(t.evidence?.accessibleRestroom).toEqual({ level: "verified", source: "osm:wheelchair=yes" });
+    const r = cand({ highway: "services", name: "Plaza", "toilets:wheelchair": "no" });
+    expect(r.evidence?.accessibleRestroom?.level).toBe("unsuitable");
+    expect(r.evidence?.service).toBe("plaza");
+  });
+
+  it("unknown diner → everything unknown", () => {
+    const d = cand({ amenity: "restaurant", name: "Joe's Diner" });
+    for (const k of ["restroom", "accessibleRestroom", "vegetarian", "vegan", "halal", "gluten_free"] as const) {
+      expect(d.evidence?.[k]?.level).toBe("unknown");
+    }
+    expect(d.categories).toEqual(["meal"]);
+  });
+
+  it("brand matching by brand:wikidata / name variants", () => {
+    expect(matchBrand({ "brand:wikidata": "Q38076", name: "x" })?.brand).toBe("McDonald's");
+    expect(matchBrand({ name: "McDonalds" })?.brand).toBe("McDonald's");
+    expect(matchBrand({ name: "Tim Hortons Cafe & Bake Shop" })?.brand).toBe("Tim Hortons");
+    expect(matchBrand({ name: "Shellys Bistro" })).toBeNull();
+    expect(BRAND_PROFILES.every((b) => b.vegetarian !== ("verified" as string))).toBe(true);
+    expect(BRAND_PROFILES.every((b) => !b.url || /^https:\/\/www\.[a-z0-9.-]+$/.test(b.url))).toBe(true);
+  });
+
+  it("no exact menu items anywhere in the brand table or evidence", () => {
+    const src = readFileSync(path.resolve(__dirname, "../lib/providers/brandEvidence.ts"), "utf8").toLowerCase();
+    const evidenceText = JSON.stringify(
+      ["Tim Hortons", "Subway", "McDonald's", "Starbucks", "Chipotle", "A&W", "Taco Bell"].map((n) => cand({ amenity: "fast_food", name: n }).evidence)
+    ).toLowerCase();
+    const items = ["veggie delite", "beyond meat", "impossible", "sofritas", "veggie burger", "hash brown", "bagel", "wrap", "salad", "bean burrito", "falafel", "timbits", "oatmeal", "fries"];
+    for (const item of items) {
+      expect(src.includes(item), `brandEvidence.ts mentions "${item}"`).toBe(false);
+      expect(evidenceText.includes(item), `evidence mentions "${item}"`).toBe(false);
+    }
+  });
+
+  it("restroom need broadens the query to quick-service + staffed fuel; node+way only", () => {
+    const q = selectorsFor(["restroom"]).join("\n");
+    expect(q).toContain("fast_food");
+    expect(q).toContain('["amenity"="fuel"]["shop"="convenience"]');
+    expect(q).toContain("rest_area");
+    expect(q).not.toMatch(/\bnwr\[/);
+    expect(selectorsFor(["coffee"]).join(" ")).toMatch(/cafe\|fast_food|fast_food\|cafe/);
+  });
+
+  it("TomTom results carry unknown restroom/diet evidence", () => {
+    const e = tomtomEvidence("restaurant", ["restaurant", "steak house"]);
+    expect(e.restroom?.level).toBe("unknown");
+    expect(e.vegetarian?.level).toBe("unknown");
+    expect(tomtomEvidence("restaurant", ["vegetarian"]).vegetarian?.level).toBe("possible");
+  });
+});
+
+describe("cacheOnly fast path", () => {
+  it("tile miss is traced as not cached, no live Overpass, no TomTom fallback", async () => {
+    process.env.TOMTOM_LIVE = "1";
+    process.env.TOMTOM_API_KEY = "test";
+    resetBudgets();
+    const f = vi.fn(async () => new Response(JSON.stringify({ elements: [], results: [] }), { status: 200 }));
+    const provider = new RoutePlaceProvider(route, { fetchImpl: f as unknown as typeof fetch, cacheOnly: true });
+    const stops = await provider.getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] });
+    expect(stops).toEqual([]);
+    expect(f).not.toHaveBeenCalled();
+    const trace = provider.trace.join("\n");
+    expect(trace).toMatch(/tile km 0–30: not cached \(skipped in fast path\)/);
+    expect(trace).not.toMatch(/OSM lookup failed/);
+    expect(trace).not.toMatch(/tomtom along-route/);
+  });
+
+  it("uses tiles already cached by a normal (live) provider", async () => {
+    const f = overpassFetch([el({ amenity: "fast_food", name: "Subway", cuisine: "sandwich" }, 40)]);
+    await new RoutePlaceProvider(route, { fetchImpl: f.fn }).getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] });
+    const calls = f.mock.mock.calls.length;
+    const fast = new RoutePlaceProvider(route, { fetchImpl: f.fn, cacheOnly: true });
+    const stops = await fast.getCandidates("initial", { minKm: 25, maxKm: 55, needs: ["meal"] });
+    expect(f.mock.mock.calls.length).toBe(calls);
+    expect(stops.map((s) => s.name)).toEqual(["Subway"]);
+    expect(stops[0].provenance).toBe("cached");
   });
 });

@@ -70,6 +70,7 @@ export default function TripMap(props: TripMapProps) {
   const stopLayer = useRef<Leaflet.LayerGroup | null>(null);
   const exitLayer = useRef<Leaflet.LayerGroup | null>(null);
   const routeLayer = useRef<Leaflet.LayerGroup | null>(null);
+  const fittedRouteId = useRef<string | null>(null);
   const route = props.route ?? TORONTO_MONTREAL;
   const propsRef = useRef(props);
   propsRef.current = props;
@@ -121,7 +122,11 @@ export default function TripMap(props: TripMapProps) {
     if (!ready || !L || !map || !routeLayer.current) return;
     routeLayer.current.clearLayers();
     const line = L.polyline(route.latLngs(), { color: "#0f2a43", weight: 5, opacity: 0.75 }).addTo(routeLayer.current);
-    map.fitBounds(line.getBounds(), { padding: [20, 20] });
+    // Fit only for a new route; progressive updates (exits arriving later) keep the user's view.
+    if (fittedRouteId.current !== route.id) {
+      map.fitBounds(line.getBounds(), { padding: [20, 20] });
+      fittedRouteId.current = route.id;
+    }
   }, [ready, route]);
 
   // ---- exits (exits along the route; upcoming reachable ones emphasised) ----

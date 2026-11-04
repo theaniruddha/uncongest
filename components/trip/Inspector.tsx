@@ -2,6 +2,20 @@
 
 import { useState } from "react";
 import type { EngineResult } from "@/lib/domain/types";
+import type { WorkflowSummary } from "@/lib/agent2/metrics";
+
+export interface PerfView {
+  tactical: WorkflowSummary;
+  strategic: WorkflowSummary;
+  staleTactical: number;
+  staleStrategic: number;
+  timings: { geometryMs?: number; exitsMs?: number; exitsStatus?: string; placesMs?: number; firstStrategicMs?: number; firstTacticalMs?: number };
+  strategicStatus: string;
+  strategicTrace: Array<{ tool: string; input: string; output: string; provenance?: string; ms?: number }>;
+  strategicMuse?: { ms: number; usage?: unknown; error?: string };
+}
+
+const fmt = (ms?: number | null) => (ms == null ? "—" : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
 
 export interface Agent1Trace {
   time: string;
@@ -14,6 +28,7 @@ export interface Agent1Trace {
 
 /** Agent 1 / Agent 2 inspector: real tool traces and API budget counters; raw JSON tucked away. */
 export default function Inspector({
+  perf,
   result,
   usage: usageProp,
   request,
@@ -21,6 +36,7 @@ export default function Inspector({
   contextIncluded,
   prefetchTrace
 }: {
+  perf?: PerfView;
   result: (EngineResult & { dataMode?: string }) | null;
   usage?: NonNullable<EngineResult["usage"]>;
   request: unknown;
@@ -28,16 +44,18 @@ export default function Inspector({
   contextIncluded: string[];
   prefetchTrace: string[];
 }) {
-  const [tab, setTab] = useState<"agent2" | "agent1" | "budget">("agent2");
+  const [tab, setTab] = useState<"agent2" | "strategic" | "agent1" | "budget" | "perf">("agent2");
   const usage = usageProp?.length ? usageProp : result?.usage ?? [];
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-3 text-xs" data-testid="inspector">
       <div className="flex gap-1" role="tablist">
         {(
           [
-            ["agent2", "Agent 2 · decision"],
-            ["agent1", "Agent 1 · intent"],
-            ["budget", "API budgets"]
+            ["agent2", "Tactical"],
+            ["strategic", "Strategic"],
+            ["agent1", "Agent 1"],
+            ["budget", "API budgets"],
+            ["perf", "Performance"]
           ] as const
         ).map(([k, l]) => (
           <button key={k} role="tab" aria-selected={tab === k} onClick={() => setTab(k)} className={`rounded px-2 py-1 ${tab === k ? "bg-navy text-white" : "border border-slate-300"}`}>
@@ -112,6 +130,81 @@ export default function Inspector({
               </details>
             </>
           )}
+        </div>
+      )}
+
+      {tab === "strategic" && perf && (
+        <div className="mt-2 space-y-1">
+          <p>
+            Status: <strong>{perf.strategicStatus}</strong>
+            {perf.strategicMuse ? ` · Muse ${fmt(perf.strategicMuse.ms)}${perf.strategicMuse.error ? ` (${perf.strategicMuse.error})` : ""}` : ""}
+          </p>
+          <table className="w-full table-fixed border-collapse">
+            <tbody>
+              {perf.strategicTrace.map((t, i) => (
+                <tr key={i} className="border-t border-slate-100 align-top">
+                  <td className="w-[30%] break-all py-1 pr-1 font-mono text-[10px] text-navy">{t.tool}</td>
+                  <td className="break-words py-1">
+                    {t.output}
+                    {t.provenance && <span className="ml-1 rounded bg-slate-100 px-1 text-[10px] text-slate-500">{t.provenance}</span>}
+                  </td>
+                  <td className="w-12 py-1 text-right text-slate-400">{t.ms ?? ""}</td>
+                </tr>
+              ))}
+              {perf.strategicTrace.length === 0 && (
+                <tr>
+                  <td className="text-slate-500">No strategic run yet.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tab === "perf" && perf && (
+        <div className="mt-2 space-y-2" data-testid="perf">
+          <table className="w-full">
+            <thead>
+              <tr className="text-left text-slate-500">
+                <th>Workflow</th>
+                <th className="text-right">n</th>
+                <th className="text-right">p50</th>
+                <th className="text-right">p95</th>
+                <th className="text-right">≤ target</th>
+                <th className="text-right">fallback</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(
+                [
+                  ["Tactical (5 s)", perf.tactical],
+                  ["Strategic (30 s)", perf.strategic]
+                ] as const
+              ).map(([name, w]) => (
+                <tr key={name} className="border-t border-slate-100">
+                  <td className="py-1">{name}</td>
+                  <td className="text-right">{w.count}</td>
+                  <td className="text-right">{fmt(w.p50)}</td>
+                  <td className="text-right">{fmt(w.p95)}</td>
+                  <td className="text-right">{w.withinTargetPct == null ? "—" : `${w.withinTargetPct}%`}</td>
+                  <td className="text-right">{w.fallbackPct == null ? "—" : `${w.fallbackPct}%`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p>
+            Stale results rejected: tactical {perf.staleTactical}, strategic {perf.staleStrategic} · strategic timeouts {perf.strategic.timeoutPct ?? 0}%
+          </p>
+          <p className="font-semibold text-navy">Startup (from “Plan route”)</p>
+          <ul>
+            <li>Map + route + baseline ETA: {fmt(perf.timings.geometryMs)}</li>
+            <li>
+              Exits: {fmt(perf.timings.exitsMs)} {perf.timings.exitsStatus ? `(${perf.timings.exitsStatus})` : ""}
+            </li>
+            <li>First real places: {fmt(perf.timings.placesMs)}</li>
+            <li>First strategic plan: {fmt(perf.timings.firstStrategicMs)}</li>
+            <li>First tactical decision: {fmt(perf.timings.firstTacticalMs)}</li>
+          </ul>
         </div>
       )}
 

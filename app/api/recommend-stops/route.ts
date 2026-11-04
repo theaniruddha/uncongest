@@ -4,6 +4,7 @@ import { decideWithExploration, urgencyForRequest } from "@/lib/domain/engine";
 import type { EligibleStop, RecommendStopsRequest, RejectionReason, StopCandidate, ToolTraceEntry, WeatherSnapshot } from "@/lib/domain/types";
 import { HORIZON, type UrgencyResult } from "@/lib/domain/urgency";
 import { getAiProvider } from "@/lib/providers/ai";
+import { runTactical, type TacticalDecision, type TacticalMeta } from "@/lib/agent2/tactical";
 import { allUsage, getBudget } from "@/lib/providers/budget";
 import { getPlaceProvider, type PlaceProvider } from "@/lib/providers/places";
 import { routeModelForRef } from "@/lib/providers/routeRef";
@@ -13,6 +14,11 @@ import { addMinutesLocal, getWeatherProvider, todayLocalDate, type WeatherReadin
 import { TORONTO_MONTREAL } from "@/lib/route/route";
 
 export const dynamic = "force-dynamic";
+
+/** Resolve `p` or give up after `ms` (returns `fallback`). Used to keep the Tactical path inside its budget. */
+function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
+}
 
 function snap(r: WeatherReading): WeatherSnapshot {
   const { id, condition, tempC, precipProbability, description, source, forHour, stale, note } = r;
@@ -47,8 +53,10 @@ export async function POST(req: Request) {
   };
 
   // ---- Context layer: route, positions + weather at each car now ----
+  const startedAt = Date.now();
   const ctx = request.context;
   const tripCtx = ctx;
+  const tactical = ctx?.workflow === "tactical";
   const sessionId = ctx?.sessionId ?? "anon";
   const realData = ctx?.dataMode === "real";
   let route: RouteModel = TORONTO_MONTREAL;
@@ -115,7 +123,8 @@ export async function POST(req: Request) {
   let realPlaces: RoutePlaceProvider | null = null;
   let placeProvider: PlaceProvider = getPlaceProvider();
   if (realData) {
-    realPlaces = new RoutePlaceProvider(route, { sessionId, tomtomVerifyTop: ctx?.tomtomVerifyTop ?? 0 });
+    // Tactical fast path: only already-discovered (cached/recorded) places — no new broad searches.
+    realPlaces = new RoutePlaceProvider(route, { sessionId, tomtomVerifyTop: tactical ? 0 : ctx?.tomtomVerifyTop ?? 0, cacheOnly: tactical });
     const rp = realPlaces;
     const windows = windowsForDecision(lead.progressKm, lead.speedKph, HORIZON[urgency.level].maxKm, route.totalKm, request.config.advanceNoticeMinutes);
     // Urgency-bounded, selective discovery: "initial" only searches the horizon windows ahead.
@@ -141,6 +150,8 @@ export async function POST(req: Request) {
   const providerNote = { value: provider.name };
   let stopWeather: Record<string, WeatherSnapshot> = {};
   let eligibleSeen: EligibleStop[] = [];
+  let tacticalMeta: TacticalMeta | null = null;
+  let tacticalDecision: TacticalDecision | null = null;
   const llmResolver = async (ctx: {
     eligible: EligibleStop[];
     rejected: RejectionReason[];
@@ -149,7 +160,37 @@ export async function POST(req: Request) {
     exploration: string[];
   }) => {
     eligibleSeen = ctx.eligible;
-    stopWeather = await stopWeatherFor(ctx.eligible);
+    stopWeather = tactical ? await within(stopWeatherFor(ctx.eligible), 1500, {}) : await stopWeatherFor(ctx.eligible);
+    if (tactical) {
+      const t = await runTactical({
+        trip: enriched.trip,
+        config: enriched.config,
+        cars: enriched.cars,
+        intent: enriched.collectiveIntent,
+        environment,
+        eligible: ctx.eligible,
+        rejected: ctx.rejected,
+        triggerReasons: ctx.triggerReasons,
+        urgency: ctx.urgency,
+        exploration: [...contextNotes, ...ctx.exploration],
+        weatherAtArrival: stopWeather,
+        weatherAtCars: carWeather,
+        tripContext: tripCtx?.agentContext,
+        preferences: tripCtx ? { mood: tripCtx.mood, mealPreference: tripCtx.mealPreference, customMeal: tripCtx.customMeal } : undefined,
+        strategicHints: tripCtx?.strategicHints ?? []
+      });
+      tacticalMeta = t.meta;
+      tacticalDecision = t.decision;
+      trace.push({
+        tool: "agent2.tactical",
+        input: `${ctx.eligible.length} validated candidate(s), urgency ${ctx.urgency.level}, ${tripCtx?.strategicHints?.length ?? 0} strategic hint(s)`,
+        output: t.decision ? `${t.decision.decision}: ${t.decision.picks.map((p) => p.stopId).join(", ") || "—"}` : `${t.meta.status} → deterministic ranking (${t.meta.detail ?? ""})`,
+        provenance: t.meta.status === "muse" ? "live" : "simulated",
+        ms: t.meta.ms
+      });
+      providerNote.value = t.meta.status === "muse" ? "muse tactical" : `deterministic fallback (tactical ${t.meta.status})`;
+      return t.llm;
+    }
     const t0 = Date.now();
     try {
       const decision = await provider.decide({
@@ -198,6 +239,8 @@ export async function POST(req: Request) {
     recommendedStops: recommended.map((id) => eligibleSeen.find((e) => e.stop.id === id)?.stop).filter(Boolean),
     toolTrace: trace,
     usage: (getBudget("tomtom"), allUsage(sessionId)),
-    dataMode: ctx?.dataMode ?? "demo"
+    dataMode: ctx?.dataMode ?? "demo",
+    tactical: tactical ? { ...((tacticalMeta as TacticalMeta | null) ?? { status: "fallback", provider: "deterministic", ms: 0, detail: "no candidates" }), decision: (tacticalDecision as TacticalDecision | null)?.decision, headline: (tacticalDecision as TacticalDecision | null)?.headline, totalMs: Date.now() - startedAt } : undefined,
+    decidedFor: { elapsedMinutes: request.trip.elapsedMinutes, leadKm: lead.progressKm, contextVersion: ctx?.contextVersion ?? null }
   });
 }

@@ -137,11 +137,16 @@ describe("eligibility", () => {
     expect(rejected.every((r) => r.reasons.join(" ").match(/stale/))).toBe(true);
   });
 
-  it("no-optional-stops window suppresses early stops unless urgent", () => {
+  it("no-optional-stops window holds routine stops but not explicit or urgent requests", () => {
     const earlyTrip = { ...baseTrip, elapsedMinutes: 20 };
-    const mild: CollectiveIntent = { ...hungryIntent, hungerLevel: 1 };
-    const { rejected } = evaluateCandidates(stops, makeCars(), mild, baseConfig, earlyTrip, baseEnv);
-    expect(rejected.length).toBeGreaterThan(0);
+    const routine: CollectiveIntent = { ...hungryIntent, need: [], hungerLevel: 1 };
+    const quietCars = makeCars().map((c) => ({ ...c, needs: [] }));
+    const held = evaluateCandidates(stops, quietCars, routine, baseConfig, earlyTrip, baseEnv);
+    expect(held.rejected.some((r) => r.reasons.join(" ").includes("no-optional-stops window"))).toBe(true);
+    const explicit = evaluateCandidates(stops, quietCars, { ...routine, need: ["restroom"] }, baseConfig, earlyTrip, baseEnv);
+    expect(explicit.rejected.some((r) => r.reasons.join(" ").includes("no-optional-stops window"))).toBe(false);
+    const urgent = evaluateCandidates(stops, quietCars, { ...routine, restroomUrgent: true }, baseConfig, earlyTrip, baseEnv);
+    expect(urgent.rejected.some((r) => r.reasons.join(" ").includes("no-optional-stops window"))).toBe(false);
   });
 });
 

@@ -32,7 +32,8 @@ export const tripContextSchema = z.object({
   /** Local calendar date (America/Toronto) of the simulated/live clock; used for weather lookup. */
   localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   /** Minutes since last confirmed meal; null/absent = unknown (never assumed). */
-  lastMealMinutesAgo: z.number().min(0).nullable().optional()
+  lastMealMinutesAgo: z.number().min(0).nullable().optional(),
+  overrideInitialQuiet: z.boolean().optional()
 });
 
 export const tripConfigSchema = z.object({
@@ -85,7 +86,26 @@ export const recommendStopsRequestSchema = z.object({
       /** Compact relevance-aware context from lib/context/builder.ts (already filtered client-side). */
       agentContext: z.record(z.unknown()).optional(),
       /** Opt-in TomTom verification of the top N candidates (still budgeted server-side). */
-      tomtomVerifyTop: z.number().int().min(0).max(3).default(0)
+      tomtomVerifyTop: z.number().int().min(0).max(3).default(0),
+      /** "tactical" = Agent 2 Tactical workflow (5 s deadline, cached data only); "classic" = original path. */
+      workflow: z.enum(["tactical", "classic"]).default("classic"),
+      /** Client's context version; echoed back so late results can be recognised as stale. */
+      contextVersion: z.string().max(80).optional(),
+      strategicHints: z
+        .array(
+          z.object({
+            id: z.string().max(80),
+            kind: z.string().max(40),
+            title: z.string().max(140),
+            fromKm: z.number(),
+            toKm: z.number(),
+            candidateIds: z.array(z.string().max(120)).max(8),
+            priority: z.string().max(10),
+            watchFor: z.string().max(200).optional()
+          })
+        )
+        .max(6)
+        .default([])
     })
     .optional(),
   options: z

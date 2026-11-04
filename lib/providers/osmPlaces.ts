@@ -1,4 +1,5 @@
-import type { ChargerSpec, Dietary, Need, StopCandidate } from "@/lib/domain/types";
+import type { ChargerSpec, Dietary, EvidenceItem, Need, PlaceEvidence, StopCandidate } from "@/lib/domain/types";
+import { CHAIN_RESTROOM_SOURCE, CHAIN_VEG_SOURCE, matchBrand, type BrandProfile, type ServiceKind } from "./brandEvidence";
 import { exitLabel, type RouteExit, type RouteModel } from "@/lib/route/model";
 import { overpassQuery } from "./overpass";
 
@@ -16,7 +17,8 @@ export const SAMPLE_RADIUS_M = 1500;
 export const SAMPLE_STEP_KM = 8;
 export const MAX_EXITS = 8;
 export const MAX_SAMPLES = 12;
-export const MAX_CANDIDATES = 25;
+/** Per-window/tile cap after ranking. */
+export const MAX_CANDIDATES = 40;
 /** Places projecting further than this from the road are ignored (parallel roads, towns). */
 const MAX_OFF_ROUTE_KM = 5;
 const DEFAULT_NEEDS: Need[] = ["meal", "coffee", "restroom"];
@@ -148,57 +150,160 @@ export interface PlaceKind {
   qualityScoreMock: number;
   /** Fallback label for unnamed places of this kind; undefined = skip when unnamed. */
   unnamedLabel?: string;
+  evidence: PlaceEvidence;
+  brand: BrandProfile | null;
 }
 
 const GROCERY_SHOPS = ["supermarket", "convenience", "department_store", "wholesale"];
+const BIG_BOX_SHOPS = ["supermarket", "department_store", "wholesale"];
+const FOOD_SERVICES: ServiceKind[] = ["quick_service", "sit_down", "plaza"];
 
-/** Map OSM tags to a kind + Need[] categories. Returns null for irrelevant / private places. */
+const ev = (level: EvidenceItem["level"], source: string, extra: Partial<EvidenceItem> = {}): EvidenceItem => ({ level, source, ...extra });
+const UNKNOWN = (): EvidenceItem => ev("unknown", "no data");
+
+/** Rough service kind from OSM tags, brand profile winning for food chains. */
+export function serviceKindFromTags(tags: Tags, brand: BrandProfile | null = matchBrand(tags)): ServiceKind {
+  if (tags.highway === "services") return "plaza";
+  if (tags.highway === "rest_area") return "rest_area";
+  const a = tags.amenity;
+  if (a === "fuel") return "fuel";
+  if (a === "toilets" || a === "charging_station") return "other";
+  if (brand && (a === "fast_food" || a === "restaurant" || a === "cafe" || brand.service === "big_box")) return brand.service;
+  if (a === "fast_food" || a === "food_court") return "quick_service";
+  if (a === "restaurant") return "sit_down";
+  if (a === "cafe") return "cafe";
+  if (tags.shop === "convenience") return "convenience";
+  if (tags.shop && BIG_BOX_SHOPS.includes(tags.shop)) return "big_box";
+  return "other";
+}
+
+/**
+ * Restroom / accessibility / diet evidence from explicit OSM tags first, then chain-level
+ * brand evidence ("possible"), then a few cuisine hints ("possible"). Heuristics are never "verified".
+ */
+export function evidenceFromTags(tags: Tags, brand: BrandProfile | null = matchBrand(tags)): PlaceEvidence {
+  const service = serviceKindFromTags(tags, brand);
+  const a = tags.amenity;
+
+  // restroom
+  let restroom: EvidenceItem = UNKNOWN();
+  if (a === "toilets") restroom = ev("verified", "osm:amenity=toilets");
+  else if (tags.highway === "services") restroom = ev("verified", "osm:highway=services");
+  else if (tags.highway === "rest_area") restroom = ev("verified", "osm:highway=rest_area");
+  else if (tags.toilets === "yes") restroom = ev("verified", "osm:toilets=yes");
+  else if (tags.toilets === "no") restroom = ev("unsuitable", "osm:toilets=no");
+  else if (a === "fuel" && tags.shop === "convenience") restroom = ev("possible", CHAIN_RESTROOM_SOURCE, { note: "staffed fuel station with convenience shop" });
+  else if (brand && brand.restroom === "possible" && a !== "fuel") restroom = ev("possible", CHAIN_RESTROOM_SOURCE, { note: `${brand.brand} locations typically have customer washrooms` });
+  else if (a === "food_court") restroom = ev("possible", CHAIN_RESTROOM_SOURCE, { note: "food courts typically share washrooms" });
+
+  // accessible restroom
+  let accessibleRestroom: EvidenceItem = UNKNOWN();
+  if (tags["toilets:wheelchair"] === "yes") accessibleRestroom = ev("verified", "osm:toilets:wheelchair=yes");
+  else if (a === "toilets" && tags.wheelchair === "yes") accessibleRestroom = ev("verified", "osm:wheelchair=yes");
+  else if (tags["toilets:wheelchair"] === "no") accessibleRestroom = ev("unsuitable", "osm:toilets:wheelchair=no");
+  else if (a === "toilets" && tags.wheelchair === "no") accessibleRestroom = ev("unsuitable", "osm:wheelchair=no");
+
+  // diet
+  const cuisine = list(tags.cuisine);
+  const diet = (d: Dietary): EvidenceItem => {
+    const v = tags[`diet:${d}`];
+    if (v === "yes" || v === "only") return ev("verified", `osm:diet:${d}=${v}`);
+    if (d === "vegetarian" && (tags["diet:vegan"] === "yes" || tags["diet:vegan"] === "only")) return ev("verified", `osm:diet:vegan=${tags["diet:vegan"]}`);
+    if (v === "no") return ev("unsuitable", `osm:diet:${d}=no`);
+    if (d === "vegan") {
+      const meat = cuisine.find((c) => c === "steak_house" || c === "bbq");
+      if (meat) return ev("unsuitable", `osm:cuisine=${meat} (heuristic)`);
+      if (cuisine.includes("vegan")) return ev("possible", "osm:cuisine=vegan (heuristic)");
+    }
+    if (d === "vegetarian") {
+      const hint = cuisine.find((c) => ["indian", "falafel", "vegetarian", "vegan"].includes(c));
+      if (hint) return ev("possible", `osm:cuisine=${hint} (heuristic)`);
+      if (brand && brand.vegetarian === "possible") {
+        return ev("possible", brand.vegSource ?? CHAIN_VEG_SOURCE, brand.url ? { url: brand.url } : {});
+      }
+    }
+    return UNKNOWN();
+  };
+
+  return {
+    restroom,
+    accessibleRestroom,
+    vegetarian: diet("vegetarian"),
+    vegan: diet("vegan"),
+    halal: diet("halal"),
+    gluten_free: diet("gluten_free"),
+    service
+  };
+}
+
+/** Map OSM tags to a kind + Need[] categories + evidence. Returns null for irrelevant / private places. */
 export function classifyTags(tags: Tags): PlaceKind | null {
   const amenity = tags.amenity;
   const shop = tags.shop;
-  const toiletsYes = tags.toilets === "yes";
+  const brand = matchBrand(tags);
+  let type: string;
+  let quality = 0.6;
+  let unnamedLabel: string | undefined;
   const cats = new Set<Need>();
-  let kind: PlaceKind;
 
   if (tags.highway === "services") {
-    kind = { type: "highway-plaza", categories: [], restroomsVerified: true, qualityScoreMock: 0.65, unnamedLabel: "Service centre" };
-    ["meal", "coffee", "restroom"].forEach((n) => cats.add(n as Need));
+    type = "highway-plaza";
+    quality = 0.65;
+    unnamedLabel = "Service centre";
   } else if (tags.highway === "rest_area") {
-    kind = { type: "rest-area", categories: [], restroomsVerified: true, qualityScoreMock: 0.6, unnamedLabel: "Rest area" };
-    cats.add("restroom");
+    type = "rest-area";
+    unnamedLabel = "Rest area";
   } else if (amenity === "toilets") {
     if (["private", "no", "customers"].includes(tags.access ?? "")) return null;
-    kind = { type: "public-toilets", categories: [], restroomsVerified: true, qualityScoreMock: 0.6, unnamedLabel: "Public washroom" };
-    cats.add("restroom");
+    type = "public-toilets";
+    unnamedLabel = "Public washroom";
   } else if (amenity === "restaurant" || amenity === "fast_food" || amenity === "food_court") {
-    const type = amenity === "food_court" ? "food-court" : amenity === "fast_food" ? "fast-food" : "restaurant";
-    kind = { type, categories: [], restroomsVerified: toiletsYes ? true : null, qualityScoreMock: 0.6, unnamedLabel: amenity === "food_court" ? "Food court" : undefined };
-    cats.add("meal");
-    if (toiletsYes || amenity === "food_court") cats.add("restroom");
-    if (list(tags.cuisine).some((c) => ["coffee_shop", "donut"].includes(c))) cats.add("coffee");
+    type = amenity === "food_court" ? "food-court" : amenity === "fast_food" ? "fast-food" : "restaurant";
+    if (amenity === "food_court") unnamedLabel = "Food court";
   } else if (amenity === "cafe") {
-    kind = { type: "cafe", categories: [], restroomsVerified: toiletsYes ? true : null, qualityScoreMock: 0.6 };
-    cats.add("coffee");
+    type = "cafe";
     if (list(tags.cuisine).some((c) => ["sandwich", "sandwiches", "bakery", "bagel", "breakfast"].includes(c))) cats.add("meal");
-    if (toiletsYes) cats.add("restroom");
   } else if (amenity === "fuel") {
-    kind = { type: "gas-station", categories: [], restroomsVerified: toiletsYes ? true : null, qualityScoreMock: 0.55 };
-    if (toiletsYes) cats.add("restroom");
+    type = "gas-station";
+    quality = 0.55;
     if (shop === "convenience") cats.add("grocery");
   } else if (shop && GROCERY_SHOPS.includes(shop)) {
-    kind = { type: shop === "convenience" ? "convenience" : "grocery", categories: [], restroomsVerified: toiletsYes ? true : null, qualityScoreMock: shop === "convenience" ? 0.55 : 0.6 };
+    type = shop === "convenience" ? "convenience" : "grocery";
+    if (shop === "convenience") quality = 0.55;
     cats.add("grocery");
-    if (toiletsYes) cats.add("restroom");
   } else if (amenity === "charging_station") {
     if (["private", "no"].includes(tags.access ?? "")) return null;
-    kind = { type: "ev-charger", categories: [], restroomsVerified: toiletsYes ? true : null, qualityScoreMock: 0.6, unnamedLabel: "EV charging station" };
+    type = "ev-charger";
+    unnamedLabel = "EV charging station";
     cats.add("ev_charge");
-    if (toiletsYes) cats.add("restroom");
   } else {
     return null;
   }
-  kind.categories = [...cats];
-  return kind;
+
+  const evidence = evidenceFromTags(tags, brand);
+  const service = evidence.service!;
+  // restroom: verified OR possible (the engine weighs by evidence level)
+  if (evidence.restroom?.level === "verified" || evidence.restroom?.level === "possible") cats.add("restroom");
+  const isFoodAmenity = amenity === "cafe" || amenity === "fast_food" || amenity === "restaurant" || amenity === "food_court";
+  // coffee: cafés, coffee chains, coffee/donut cuisine, plazas
+  const coffeeCuisine = list(tags.cuisine).some((c) => ["coffee_shop", "donut"].includes(c));
+  if (amenity === "cafe" || service === "plaza" || (isFoodAmenity && (brand?.coffee || coffeeCuisine))) cats.add("coffee");
+  // meal: quick service / sit down / plaza / food court / big box with a food court tag
+  const bigBoxFood = service === "big_box" && (tags.food_court === "yes" || tags.food === "yes");
+  if ((isFoodAmenity && FOOD_SERVICES.includes(service)) || service === "plaza" || amenity === "food_court" || bigBoxFood || (isFoodAmenity && brand?.meal)) {
+    cats.add("meal");
+  }
+  if (service === "cafe" && brand && !brand.meal) cats.delete("meal");
+
+  return {
+    type,
+    categories: [...cats],
+    restroomsVerified: evidence.restroom?.level === "verified" ? true : null,
+    qualityScoreMock: quality,
+    unnamedLabel,
+    evidence,
+    brand
+  };
 }
 
 /** accessMinutes = straight-line off-route km × 1.4 road factor ÷ 40 km/h × 2 ways + 2 min ramp (min 2). */
@@ -256,7 +361,7 @@ export function elementToCandidate(
   if (!kind) return null;
   const evName = kind.type === "ev-charger" ? (tags.operator ?? tags.brand) : undefined;
   // Unnamed restaurants/cafes/shops/fuel are skipped; generic labels only for public facilities.
-  const finalName = tags.name ?? tags["name:en"] ?? evName ?? kind.unnamedLabel;
+  const finalName = tags.name ?? tags["name:en"] ?? tags.brand ?? evName ?? kind.unnamedLabel;
   if (!finalName) return null;
 
   const anchor = anchorOnRoute(route, lat, lng);
@@ -293,7 +398,8 @@ export function elementToCandidate(
     qualityScoreMock: kind.qualityScoreMock,
     open24h: hours.open24h,
     accessMinutes: accessMinutesFor(offRouteKm),
-    reviewCountMock: undefined
+    reviewCountMock: undefined,
+    evidence: kind.evidence
   };
   if (hours.openingHoursRaw) c.openingHoursRaw = hours.openingHoursRaw;
   if (hours.opensLocal) c.opensLocal = hours.opensLocal;
@@ -310,7 +416,9 @@ export function elementToCandidate(
 /** Relevance: serves more of the requested needs, has a real name, closer to the road. */
 export function relevance(c: StopCandidate, needs: Need[], named: boolean): number {
   const served = c.categories.filter((n) => needs.includes(n)).length;
-  return served * 10 + (named ? 2 : 0) - (c.offRouteKm ?? 0);
+  const rr = c.evidence?.restroom?.level;
+  const evidenceBonus = rr === "verified" ? 3 : rr === "possible" ? 1 : 0;
+  return served * 10 + (named ? 2 : 0) + evidenceBonus - (c.offRouteKm ?? 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -341,19 +449,28 @@ export function windowCenters(route: RouteModel, window: { minKm: number; maxKm:
   return samples.map((p) => ({ lat: p.lat, lng: p.lng, radiusM: SAMPLE_RADIUS_M, label: `km ${p.km.toFixed(1)}` }));
 }
 
-/** OSM selectors (without the around: filter) needed to cover `needs`. */
+/**
+ * OSM selectors (without the around: filter) needed to cover `needs`. Nodes + ways only
+ * (`out center` gives ways a point); relations are skipped to keep the query cheap.
+ * - restroom also pulls quick-service/cafés (chain "possible" washrooms) and staffed fuel
+ *   stations (shop=convenience) or fuel tagged toilets=yes
+ * - coffee also pulls fast_food (coffee chains like Tim Hortons / McDonald's)
+ */
 export function selectorsFor(needs: Need[]): string[] {
   const n = new Set(needs.length ? needs : DEFAULT_NEEDS);
   const amenities = new Set<string>();
   const sel: string[] = [];
   if (n.has("meal")) ["restaurant", "fast_food", "food_court"].forEach((a) => amenities.add(a));
-  if (n.has("coffee")) amenities.add("cafe");
-  if (n.has("restroom")) amenities.add("toilets");
+  if (n.has("coffee")) ["cafe", "fast_food"].forEach((a) => amenities.add(a));
+  if (n.has("restroom")) ["toilets", "fast_food", "cafe"].forEach((a) => amenities.add(a));
   if (n.has("ev_charge")) amenities.add("charging_station");
-  if (amenities.size) sel.push(`nwr["amenity"~"^(${[...amenities].join("|")})$"]`);
-  if (n.has("meal") || n.has("coffee") || n.has("restroom")) sel.push(`nwr["highway"~"^(services${n.has("restroom") ? "|rest_area" : ""})$"]`);
-  if (n.has("restroom")) sel.push(`nwr["amenity"="fuel"]["toilets"="yes"]`);
-  if (n.has("grocery")) sel.push(`nwr["shop"~"^(${GROCERY_SHOPS.join("|")})$"]`);
+  if (amenities.size) sel.push(`nw["amenity"~"^(${[...amenities].join("|")})$"]`);
+  if (n.has("meal") || n.has("coffee") || n.has("restroom")) sel.push(`nw["highway"~"^(services${n.has("restroom") ? "|rest_area" : ""})$"]`);
+  if (n.has("restroom")) {
+    sel.push(`nw["amenity"="fuel"]["toilets"="yes"]`);
+    sel.push(`nw["amenity"="fuel"]["shop"="convenience"]`);
+  }
+  if (n.has("grocery")) sel.push(`nw["shop"~"^(${GROCERY_SHOPS.join("|")})$"]`);
   return sel;
 }
 
@@ -386,13 +503,13 @@ export interface OsmDiscovery {
 
 /**
  * Discover real places for ONE km window. Throws (OverpassUnavailableError) when Overpass is
- * unavailable or over budget — callers decide on a fallback; nothing is fabricated here.
+ * unavailable or over budget, or (cacheOnly) when the window isn't cached — callers decide on a fallback; nothing is fabricated here.
  */
 export async function discoverOsmPlaces(
   route: RouteModel,
   window: { minKm: number; maxKm: number },
   needs: Need[],
-  opts: { sessionId?: string; fetchImpl?: typeof fetch } = {}
+  opts: { sessionId?: string; fetchImpl?: typeof fetch; cacheOnly?: boolean } = {}
 ): Promise<OsmDiscovery> {
   const minKm = route.clampKm(Math.min(window.minKm, window.maxKm));
   const maxKm = route.clampKm(Math.max(window.minKm, window.maxKm));
@@ -404,7 +521,7 @@ export async function discoverOsmPlaces(
   trace.push(
     `osm: window km ${minKm.toFixed(0)}–${maxKm.toFixed(0)}, needs [${effNeeds.join(", ")}], ${centers.length} search point(s): ${centers.map((c) => c.label).join("; ")}`
   );
-  const res = await overpassQuery(query, { cacheKey, sessionId: opts.sessionId, fetchImpl: opts.fetchImpl });
+  const res = await overpassQuery(query, { cacheKey, sessionId: opts.sessionId, fetchImpl: opts.fetchImpl, cacheOnly: opts.cacheOnly });
 
   const seen = new Set<string>();
   const scored: Array<{ c: StopCandidate; score: number }> = [];

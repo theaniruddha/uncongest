@@ -1,4 +1,4 @@
-import type { Need, StopCandidate } from "@/lib/domain/types";
+import type { EvidenceItem, Need, PlaceEvidence, StopCandidate } from "@/lib/domain/types";
 import type { RouteModel } from "@/lib/route/model";
 import { getBudget } from "./budget";
 import { accessMinutesFor, anchorOnRoute, vegOptionsFromTags } from "./osmPlaces";
@@ -260,7 +260,8 @@ export function tomtomResultToCandidate(
     parkingVerified: null,
     qualityScoreMock: type === "gas-station" ? 0.55 : 0.6,
     open24h: hours?.open24h ?? false,
-    accessMinutes
+    accessMinutes,
+    evidence: tomtomEvidence(type, names)
   };
   if (hours?.opensLocal) c.opensLocal = hours.opensLocal;
   if (hours?.closesLocal) c.closesLocal = hours.closesLocal;
@@ -272,6 +273,32 @@ export function tomtomResultToCandidate(
     }
   }
   return c;
+}
+
+/**
+ * TomTom gives no facility data: restroom/accessibility unknown; diet unknown unless the
+ * category itself is vegetarian/vegan (then only "possible" — category-level, not verified).
+ */
+export function tomtomEvidence(type: string, categoryNames: string[]): PlaceEvidence {
+  const unknown = (): EvidenceItem => ({ level: "unknown", source: "tomtom (no facility/diet data)" });
+  const cat = (word: string): EvidenceItem =>
+    categoryNames.some((n) => n.includes(word)) ? { level: "possible", source: `tomtom category: ${word}` } : unknown();
+  const service: PlaceEvidence["service"] =
+    type === "fast-food" ? "quick_service" :
+    type === "restaurant" ? "sit_down" :
+    type === "cafe" ? "cafe" :
+    type === "gas-station" ? "fuel" :
+    type === "rest-area" ? "rest_area" :
+    type === "grocery" ? "big_box" : "other";
+  return {
+    restroom: unknown(),
+    accessibleRestroom: unknown(),
+    vegetarian: categoryNames.some((n) => n.includes("vegan")) ? { level: "possible", source: "tomtom category: vegan" } : cat("vegetarian"),
+    vegan: cat("vegan"),
+    halal: unknown(),
+    gluten_free: unknown(),
+    service
+  };
 }
 
 /**

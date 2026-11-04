@@ -65,6 +65,22 @@ export function nextWinterDate(todayLocalDate: string): string {
 
 export const SCENARIO_PRESETS: ScenarioPreset[] = [
   {
+    id: "demo-3min",
+    title: "▶ 3-minute demo",
+    blurb:
+      "Simulated Mississauga home → Letchworth at 10:15, two kids, hungry later. Lunch comes due near the Niagara border crossing, so Strategic compares stopping before vs after it; Tactical recommends; then try 'Urgent washroom' or 'Rain'.",
+    setup: (today) =>
+      build({
+        origin: HOME_PRESET,
+        destination: LETCHWORTH,
+        departure: departAt(today, "10:15"),
+        mood: ["relaxed", "hungry"],
+        mealPreference: "auto",
+        mealHistory: { kind: "unknown" },
+        cars: [car("car_a", { adults: 2, kids: 2 })]
+      })
+  },
+  {
     id: "early-lunch-overdue",
     title: "Early start, lunch overdue",
     blurb: "Leave the simulated Mississauga home at 07:30 for Letchworth with two kids — lunch comes due mid-trip.",

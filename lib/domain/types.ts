@@ -31,6 +31,8 @@ export interface TripContext {
   minutesSinceLastStop?: number;
   localDate?: string;
   lastMealMinutesAgo?: number | null;
+  /** Set when the watcher found a final good opportunity before a long gap during the early quiet window. */
+  overrideInitialQuiet?: boolean;
 }
 
 export interface CollectiveIntent {
@@ -222,6 +224,9 @@ export interface RecommendStopsRequest {
     customMeal?: string;
     agentContext?: Record<string, unknown>;
     tomtomVerifyTop: number;
+    workflow: "tactical" | "classic";
+    contextVersion?: string;
+    strategicHints: Array<{ id: string; kind: string; title: string; fromKm: number; toKm: number; candidateIds: string[]; priority: string; watchFor?: string }>;
   };
 }
 

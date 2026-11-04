@@ -6,6 +6,10 @@ import SetupPanel, { type PresetOption } from "./SetupPanel";
 import RecommendationCard from "./RecommendationCard";
 import ActiveStopCard from "./ActiveStopCard";
 import Inspector, { type Agent1Trace } from "./Inspector";
+import StrategicPanel from "./StrategicPanel";
+import { useStrategic } from "./useStrategic";
+import { summarize, versionHash, type WorkflowSample } from "@/lib/agent2/metrics";
+import { checkTacticalStaleness } from "@/lib/agent2/staleness";
 import RoadAhead, { type RoadAheadWaypoint } from "../RoadAhead";
 import { createRouteModel, type RouteModel } from "@/lib/route/model";
 import type { TripRoute, TripSetup, StopPlan } from "@/lib/trip/types";
@@ -31,6 +35,8 @@ const TripMap = dynamic(() => import("../TripMap"), {
 
 const RATES = [1, 10, 60, 120, 300];
 const NOTICE_MIN = 10;
+/** Early-trip quiet window after leaving Home: routine reminders are held (explicit/urgent needs pass). */
+const HOME_QUIET_MIN = Number(process.env.NEXT_PUBLIC_HOME_QUIET_MIN ?? 30);
 const URGENCY_STYLE: Record<UrgencyLevel, string> = {
   none: "bg-slate-100 text-slate-600",
   low: "bg-sky-100 text-sky-800",
@@ -38,7 +44,12 @@ const URGENCY_STYLE: Record<UrgencyLevel, string> = {
   high: "bg-red-100 text-red-700"
 };
 
-type TripResult = EngineResult & { dataMode?: string; recommendedStops?: StopCandidate[] };
+type TripResult = EngineResult & {
+  dataMode?: string;
+  recommendedStops?: StopCandidate[];
+  tactical?: { status: string; provider: string; ms: number; totalMs?: number; detail?: string; decision?: string; headline?: string };
+  decidedFor?: { elapsedMinutes: number; leadKm: number; contextVersion: string | null };
+};
 
 interface Plan {
   route: TripRoute;
@@ -107,6 +118,14 @@ export default function TripPlanner() {
   const [loading, setLoading] = useState(false);
   const loadingRef = useRef(false);
   const [heldForDecision, setHeldForDecision] = useState(false);
+  const [weatherOverride, setWeatherOverride] = useState<"live" | "rain" | "snow" | "cold">("live");
+  const [timings, setTimings] = useState<{ geometryMs?: number; exitsMs?: number; exitsStatus?: string; placesMs?: number; firstStrategicMs?: number; firstTacticalMs?: number; clickAt?: number }>({});
+  const [tacticalState, setTacticalState] = useState<{ status: "idle" | "running" | "muse" | "fallback" | "timeout" | "stale" | "error"; ms?: number; headline?: string; decision?: string; detail?: string }>({ status: "idle" });
+  const [tacticalSamples, setTacticalSamples] = useState<WorkflowSample[]>([]);
+  const [strategicSamples, setStrategicSamples] = useState<WorkflowSample[]>([]);
+  const [staleTactical, setStaleTactical] = useState(0);
+  const [strategicUpdate, setStrategicUpdate] = useState<{ title: string; reason: string } | null>(null);
+  const [exitsLoading, setExitsLoading] = useState(false);
   const playingRef = useRef(false);
   const [usage, setUsage] = useState<NonNullable<EngineResult["usage"]>>([]);
   const [memory, setMemory] = useState<WatchMemory>(EMPTY_MEMORY);
@@ -146,6 +165,8 @@ export default function TripPlanner() {
   const states = useMemo(() => (model ? tripCars.map((c) => carStateOnRoute(c, elapsed, model, stops)) : []), [model, tripCars, elapsed, stops]);
   const lead = states[0];
   const leadCar = tripCars[0];
+  const leadKmRef = useRef(0);
+  leadKmRef.current = lead?.progressKm ?? 0;
   const nowUtc = plan ? new Date(plan.departureUtc.getTime() + elapsed * 60000) : new Date();
   const nowLocal = plan ? utcToLocal(nowUtc, tz) : { date: today, time: "00:00" };
   const eta = useMemo(
@@ -203,6 +224,24 @@ export default function TripPlanner() {
   const groupUrgency = maxUrgency(Object.values(urgencyByCar));
   const groupDiet = useMemo(() => [...new Set(Object.values(intents).flatMap((i) => i.dietary))].sort(), [intents]);
 
+  // ---------------- versions (stale-result detection) ----------------
+  const routeVersion = plan ? `${plan.route.id}:${plan.route.exitsStatus ?? "ready"}` : null;
+  const contextVersion = useMemo(() => {
+    if (!plan) return null;
+    return versionHash({
+      route: plan.route.id,
+      dest: plan.setup.destination.label,
+      weather: weatherOverride,
+      cars: plan.setup.cars.map((c) => {
+        const i = intents[c.id];
+        return [c.id, i?.needs.map((n) => n.need).sort(), i?.hungerLevel, i?.restroomUrgent, i?.notHungry, i?.dietary.slice().sort()];
+      }),
+      stops: stops.filter((x) => x.status !== "PROPOSED").map((x) => `${x.stopId}:${x.status === "RESUMED" ? "COMPLETED" : x.status}`)
+    });
+  }, [plan, intents, weatherOverride, stops]);
+  const contextVersionRef = useRef(contextVersion);
+  contextVersionRef.current = contextVersion;
+
   // ---------------- playback ----------------
   playingRef.current = playing;
   useEffect(() => {
@@ -258,13 +297,15 @@ export default function TripPlanner() {
   };
 
   const planRoute = async () => {
+    const clickAt = performance.now();
     setPlanning(true);
     setPlanError(null);
     try {
       const res = await fetch("/api/route", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ origin: setup.origin, destination: setup.destination, sessionId })
+        // Progressive: geometry + baseline ETA first; exits, places, weather and Strategic follow.
+        body: JSON.stringify({ origin: setup.origin, destination: setup.destination, sessionId, exits: "defer" })
       });
       const data = await res.json().catch(() => null);
       if (!res.ok) {
@@ -272,6 +313,8 @@ export default function TripPlanner() {
         return;
       }
       const route = data as TripRoute;
+      const geometryMs = Math.round(performance.now() - clickAt);
+      setTimings({ clickAt, geometryMs });
       const m = createRouteModel({
         id: route.id,
         source: route.source,
@@ -298,10 +341,14 @@ export default function TripPlanner() {
       setPrefetchTrace([]);
       pushLog(
         "info",
-        `Route ${setup.origin.label} → ${setup.destination.label}: ${m.totalKm.toFixed(0)} km, ${m.exits().length} exits (${route.source}). Depart ${departLocal}${
+        `Route ${setup.origin.label} → ${setup.destination.label}: ${m.totalKm.toFixed(0)} km (${route.source}, shown in ${geometryMs} ms). Depart ${departLocal}${
           setup.departure.mode === "arrive_by" ? ` to arrive by ${setup.departure.time}` : ""
-        }.`
+        }.${route.exitsStatus === "pending" ? " Loading exits…" : ` ${m.exits().length} exits.`}`
       );
+      setStrategicUpdate(null);
+      setTacticalState({ status: "idle" });
+      if (route.exitsStatus === "pending") void loadExits(route, setup, clickAt);
+      else setTimings((t) => ({ ...t, exitsMs: geometryMs, exitsStatus: route.exitsStatus }));
       if (!demo) {
         const windows = opportunityWindows({
           routeKm: m.totalKm,
@@ -312,7 +359,7 @@ export default function TripPlanner() {
           mealHistory: setup.mealHistory
         });
         const ws = windows.length ? windows : [{ minKm: (speed * NOTICE_MIN) / 60, maxKm: Math.min(m.totalKm, 60), reason: "first stretch" }];
-        void discover(route, ws, setup, m);
+        void discover(route, ws, setup, m, clickAt);
       }
     } catch (e) {
       setPlanError({ message: `Couldn't reach the route service: ${(e as Error).message}`, suggestion: "Try the Toronto → Montréal demo preset" });
@@ -327,7 +374,43 @@ export default function TripPlanner() {
     destination: { label: p.setup.destination.label, lat: p.setup.destination.lat, lng: p.setup.destination.lng, type: p.setup.destination.type }
   });
 
-  const discover = async (route: TripRoute, windows: Array<{ minKm: number; maxKm: number; reason?: string }>, s: TripSetup, m: RouteModel) => {
+  /** Exits + border crossings arrive after the map is already usable. */
+  const loadExits = async (route: TripRoute, s: TripSetup, clickAt: number) => {
+    setExitsLoading(true);
+    try {
+      const res = await fetch("/api/route/exits", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: route.id, origin: s.origin, destination: s.destination, sessionId })
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      const full = data as TripRoute;
+      const m = createRouteModel({
+        id: full.id,
+        source: full.source,
+        attribution: full.attribution,
+        origin: s.origin.label,
+        destination: s.destination.label,
+        coordinates: full.coordinates,
+        exits: full.exits,
+        durationMinutes: full.durationMinutes
+      });
+      setPlan((p) => (p && p.route.id === full.id ? { ...p, route: full, model: m } : p));
+      const exitsMs = Math.round(performance.now() - clickAt);
+      setTimings((t) => ({ ...t, exitsMs, exitsStatus: full.exitsStatus }));
+      pushLog(
+        "info",
+        `Exits ready after ${(exitsMs / 1000).toFixed(1)} s: ${full.exits.length} exits${full.borderCrossings.length ? `, border crossing at km ${Math.round(full.borderCrossings[0].km)}` : ""}${full.exitsStatus === "degraded" ? " (OSM junctions unavailable — OSRM ramp steps)" : ""}.`
+      );
+    } catch (e) {
+      pushLog("error", `Exits unavailable: ${(e as Error).message}. The simulation continues without exit labels.`);
+    } finally {
+      setExitsLoading(false);
+    }
+  };
+
+  const discover = async (route: TripRoute, windows: Array<{ minKm: number; maxKm: number; reason?: string }>, s: TripSetup, m: RouteModel, clickAt?: number) => {
     const fresh = windows.filter((w) => {
       const k = `${Math.floor(w.minKm / 30)}-${Math.floor(w.maxKm / 30)}`;
       if (requestedTiles.current.has(k)) return false;
@@ -352,6 +435,7 @@ export default function TripPlanner() {
       });
       setPrefetchTrace((t) => [...t, ...(data.trace ?? [])]);
       if (data.usage?.length) setUsage(data.usage);
+      if (clickAt != null) setTimings((t) => (t.placesMs ? t : { ...t, placesMs: Math.round(performance.now() - clickAt) }));
       pushLog("info", `Found ${found.length} real place(s) from OpenStreetMap${(data.trace ?? []).some((x: string) => x.includes("failed")) ? " (some lookups failed — see inspector)" : ""}.`);
     } catch (e) {
       pushLog("error", `Real-place discovery unavailable: ${(e as Error).message}. Agent 2 will retry selectively when needed.`);
@@ -369,6 +453,64 @@ export default function TripPlanner() {
     const known = knownPlaces.some((p) => p.distanceAlongRouteKm >= from && p.distanceAlongRouteKm <= to && groupUrgency.needs.some((n) => p.categories.includes(n)));
     if (!known) void discover(plan.route, [{ minKm: from, maxKm: to, reason: `${groupUrgency.level} urgency ahead` }], plan.setup, model);
   }, [Math.floor((lead?.progressKm ?? 0) / 15), groupUrgency.level, plan?.route.id, discovering]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------- Agent 2 · Strategic Planner (background, never blocks) ----------------
+  const buildStrategicInput = useCallback(() => {
+    if (!plan || !lead || !routeVersion || !contextVersion) return null;
+    const allNeeds = Object.fromEntries(plan.setup.cars.map((c) => [c.id, (intents[c.id]?.needs ?? []).map((n) => n.need)]));
+    return {
+      routeRef: routeRef(plan),
+      routeVersion,
+      contextVersion,
+      sessionId,
+      timeZone: tz,
+      departureUtc: plan.departureUtc.toISOString(),
+      elapsedMinutes: Math.round(elapsed),
+      leadKm: Math.round(lead.progressKm * 10) / 10,
+      leadSpeedKph: leadCar.speedKph,
+      localTime: nowLocal.time,
+      needs: allNeeds,
+      mood: plan.setup.mood,
+      mealPreference: plan.setup.mealPreference,
+      mealHistory: plan.setup.mealHistory,
+      dietary: groupDiet,
+      kids: plan.setup.cars.some((c) => c.kids > 0),
+      lastMealMinutesAgo: lastMealMinutesAgo == null ? null : Math.round(lastMealMinutesAgo),
+      drivingMinutesSinceRest: Math.round(lead.drivingMinutesSinceRest),
+      dataMode: plan.setup.dataMode
+    };
+  }, [plan, lead, routeVersion, contextVersion, intents, sessionId, tz, elapsed, leadCar, nowLocal.time, groupDiet, lastMealMinutesAgo, weatherOverride]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const strategic = useStrategic({
+    enabled: Boolean(plan) && plan?.setup.dataMode !== "demo",
+    routeVersion,
+    contextVersion,
+    buildInput: buildStrategicInput,
+    onResult: (st, accepted) => {
+      if (st.ms != null) setStrategicSamples((x) => [...x.slice(-50), { ms: st.ms!, status: accepted ? st.status : "stale", at: Date.now() }]);
+      setTimings((t) => (t.firstStrategicMs || t.clickAt == null ? t : { ...t, firstStrategicMs: Math.round(performance.now() - t.clickAt) }));
+      if (!accepted) {
+        pushLog("info", `Strategic result discarded — computed for an older route/context (${st.plan?.contextVersion}); re-planning.`);
+        return;
+      }
+      pushLog("info", `Strategic plan (${st.meta?.status}, ${((st.ms ?? 0) / 1000).toFixed(1)} s): ${st.plan?.summary ?? ""}`);
+      // A better future opportunity than the current tactical pick → suggest, never silently replace.
+      const top = st.plan?.opportunities.find((o) => o.priority === "high" && o.candidateIds.length > 0);
+      const currentIds = resultRef.current?.recommendations.map((r) => r.stopId) ?? [];
+      if (top && resultRef.current && currentIds.length && !top.candidateIds.some((id) => currentIds.includes(id))) {
+        setStrategicUpdate({ title: top.title, reason: `${top.reason} (Tactical currently suggests ${resultRef.current.recommendations[0]?.name ?? "another stop"}.)` });
+      }
+    }
+  });
+  const strategicHints = useMemo(() => {
+    if (!strategic.isCurrent || !strategic.state.plan || !lead) return [];
+    return strategic.state.plan.opportunities
+      .filter((o) => o.toKm >= lead.progressKm)
+      .slice(0, 6)
+      .map((o) => ({ id: o.id, kind: o.kind, title: o.title, fromKm: o.fromKm, toKm: o.toKm, candidateIds: o.candidateIds, priority: o.priority, watchFor: o.watchFor }));
+  }, [strategic.isCurrent, strategic.state.plan, Math.floor((lead?.progressKm ?? 0) / 5)]); // eslint-disable-line react-hooks/exhaustive-deps
+  const resultRef = useRef<TripResult | null>(null);
+  resultRef.current = result;
 
   // ---------------- context + Agent 2 ----------------
   const agentContext = useMemo(() => {
@@ -434,11 +576,12 @@ export default function TripPlanner() {
         localTime: nowLocal.time,
         minutesSinceLastStop: Math.round(lead.drivingMinutesSinceRest),
         localDate: nowLocal.date,
-        lastMealMinutesAgo: lastMealMinutesAgo == null ? null : Math.round(lastMealMinutesAgo)
+        lastMealMinutesAgo: lastMealMinutesAgo == null ? null : Math.round(lastMealMinutesAgo),
+        overrideInitialQuiet: overrideQuietRef.current
       },
       config: {
         avoidRegion: null,
-        noOptionalStopsFirstMinutes: 20,
+        noOptionalStopsFirstMinutes: plan.setup.origin.type === "home" ? HOME_QUIET_MIN : 10,
         maximumDetourMinutesPerCar: plan.setup.maxDetourMinutes,
         maximumRegroupWaitMinutes: 20,
         advanceNoticeMinutes: NOTICE_MIN,
@@ -465,8 +608,8 @@ export default function TripPlanner() {
         };
       }),
       collectiveIntent: { ...collective, notHungry: plan.setup.cars.every((c) => intents[c.id]?.notHungry) },
-      environment: { weather: "sunny" as const, trafficDelayMinutes: 0, daylightMinutes },
-      options: { weatherMode: "live" as const, excludeStopIds: skipped },
+      environment: { weather: weatherOverride === "live" ? ("sunny" as const) : weatherOverride, trafficDelayMinutes: 0, daylightMinutes },
+      options: { weatherMode: weatherOverride === "live" ? ("live" as const) : ("simulated" as const), excludeStopIds: skipped },
       context: {
         route: routeRef(plan),
         sessionId,
@@ -476,10 +619,13 @@ export default function TripPlanner() {
         mealPreference: plan.setup.mealPreference,
         customMeal: plan.setup.customMeal,
         agentContext: agentContext?.context,
-        tomtomVerifyTop: 0
+        tomtomVerifyTop: 0,
+        workflow: "tactical" as const,
+        contextVersion: contextVersion ?? undefined,
+        strategicHints
       }
     };
-  }, [plan, model, lead, intents, nowLocal, tz, nowUtc, elapsed, lastMealMinutesAgo, states, skipped, sessionId, agentContext]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plan, model, lead, intents, nowLocal, tz, nowUtc, elapsed, lastMealMinutesAgo, states, skipped, sessionId, agentContext, weatherOverride, contextVersion, strategicHints]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const runDecision = useCallback(
     async (trigger: "watcher" | "manual", key?: string) => {
@@ -488,6 +634,8 @@ export default function TripPlanner() {
       loadingRef.current = true;
       setLoading(true);
       setLastRequest(body);
+      setTacticalState({ status: "running" });
+      const t0 = performance.now();
       // Simulated time holds while Uncongest decides, so a slow lookup never lets the car drive past the exit.
       const wasPlaying = playingRef.current;
       if (wasPlaying) {
@@ -507,9 +655,34 @@ export default function TripPlanner() {
           return;
         }
         const r = data as TripResult;
+        const clientMs = Math.round(performance.now() - t0);
+        const tac = r.tactical;
+        if (r.usage?.length) setUsage(r.usage);
+        setTimings((t) => (t.firstTacticalMs || t.clickAt == null ? t : { ...t, firstTacticalMs: Math.round(performance.now() - t.clickAt) }));
+        // ---- staleness: context changed, or the car passed the suggested exit while we waited ----
+        const curLead = leadKmRef.current;
+        const noticeKm = (leadCar.speedKph * NOTICE_MIN) / 60;
+        const verdict = checkTacticalStaleness(r, contextVersionRef.current, curLead, noticeKm);
+        if (verdict.stale) {
+          const contextChanged = verdict.reason === "context_changed";
+          setStaleTactical((n) => n + 1);
+          setTacticalSamples((x) => [...x.slice(-100), { ms: clientMs, status: "stale", at: Date.now() }]);
+          setTacticalState({ status: "stale", ms: clientMs, detail: contextChanged ? "situation changed while deciding" : "the car passed the suggested exit" });
+          pushLog("info", `Tactical result discarded as stale (${contextChanged ? "context changed" : "exit no longer reachable with notice"}) — re-deciding.`);
+          memoryRef.current = { ...memoryRef.current, lastKey: null, lastCallElapsed: null, lastRecommendedKm: null, lastRecommendedStopId: null };
+          setMemory(memoryRef.current);
+          return;
+        }
+        if (verdict.dropped.length) r.recommendations = r.recommendations.filter((x) => verdict.keepStopIds.includes(x.stopId)).map((x, i) => ({ ...x, rank: i + 1 }));
         setError(null);
         setResult(r);
-        if (r.usage?.length) setUsage(r.usage);
+        const status = tac?.status === "muse" ? "muse" : tac?.status === "timeout" ? "timeout" : tac ? "fallback" : "fallback";
+        setTacticalSamples((x) => [...x.slice(-100), { ms: tac?.totalMs ?? clientMs, status, at: Date.now() }]);
+        setTacticalState({ status, ms: clientMs, headline: tac?.headline, decision: tac?.decision, detail: tac?.detail });
+        if (tac?.decision === "SEARCH_FARTHER" && plan && model && lead) {
+          const from = lead.progressKm + 60;
+          void discover(plan.route, [{ minKm: from, maxKm: Math.min(model.totalKm, from + 60), reason: "Tactical asked to search farther" }], plan.setup, model);
+        }
         if (r.recommendedStops?.length) {
           setKnownPlaces((prev) => {
             const ids = new Set(prev.map((p) => p.id));
@@ -528,6 +701,7 @@ export default function TripPlanner() {
         );
       } catch (e) {
         setError(`network error: ${(e as Error).message}`);
+        setTacticalState({ status: "error", detail: (e as Error).message });
       } finally {
         loadingRef.current = false;
         setLoading(false);
@@ -537,10 +711,11 @@ export default function TripPlanner() {
         }
       }
     },
-    [buildRequest, elapsed, pushLog]
+    [buildRequest, elapsed, pushLog, leadCar, plan, model, lead] // eslint-disable-line react-hooks/exhaustive-deps
   );
   const runRef = useRef(runDecision);
   runRef.current = runDecision;
+
 
   // ---------------- ambient watcher ----------------
   const watchDecision = useMemo(() => {
@@ -556,9 +731,12 @@ export default function TripPlanner() {
       confirmedStopPending: Boolean(activeStop) || lead.phase !== "driving",
       requiredDiet: groupDiet as CarIntent["dietary"],
       avoidRegion: null,
+      departureQuiet: plan?.setup.origin.type === "home" ? { untilElapsed: HOME_QUIET_MIN, reason: "just left home" } : undefined,
       memory
     });
-  }, [lead, leadCar, model, elapsed, groupUrgency, knownPlaces, skipped, activeStop, groupDiet, memory]);
+  }, [lead, leadCar, model, elapsed, groupUrgency, knownPlaces, skipped, activeStop, groupDiet, memory, plan?.setup.origin.type]);
+  const overrideQuietRef = useRef(false);
+  overrideQuietRef.current = Boolean(watchDecision?.overrideInitialQuiet);
 
   useEffect(() => {
     if (!watcherOn || !watchDecision?.shouldCall || loadingRef.current) return;
@@ -675,8 +853,12 @@ export default function TripPlanner() {
   };
 
   // ---------------- Agent 1 conversation ----------------
-  const sendMessage = async () => {
-    const t = chatText.trim();
+  const quickSay = async (text: string) => {
+    await sendMessage(text);
+  };
+
+  const sendMessage = async (override?: string) => {
+    const t = (override ?? chatText).trim();
     if (!t || chatBusy || !plan) return;
     setChatBusy(true);
     const body = {
@@ -776,6 +958,16 @@ export default function TripPlanner() {
             <label className="inline-flex items-center gap-1 text-xs text-slate-600">
               <input type="checkbox" checked={watcherOn} onChange={(e) => setWatcherOn(e.target.checked)} /> ambient watcher
             </label>
+            <label className="text-xs text-slate-600">
+              Weather{" "}
+              <select value={weatherOverride} onChange={(e) => setWeatherOverride(e.target.value as typeof weatherOverride)} className="rounded border border-slate-300 px-1 py-0.5 text-xs" aria-label="Weather override">
+                <option value="live">live forecast</option>
+                <option value="rain">rain (simulated)</option>
+                <option value="snow">snow (simulated)</option>
+                <option value="cold">cold (simulated)</option>
+              </select>
+            </label>
+            {exitsLoading && <span className="text-[11px] text-sky-700" data-testid="exits-loading">loading exits…</span>}
             <div className="ml-auto text-right text-sm">
               <div className="font-semibold text-navy" data-testid="sim-clock">
                 {plan ? `${nowLocal.time} · t+${Math.floor(elapsed)} min` : "—"}
@@ -881,9 +1073,40 @@ export default function TripPlanner() {
       <aside className="min-w-0 space-y-3 lg:col-start-2 xl:col-start-3 xl:row-start-1">
         <section className="rounded-xl border border-slate-200 bg-white p-3" data-testid="urgency">
           <div className="flex items-center justify-between">
-            <h2 className="text-base font-bold text-navy">Right now</h2>
+            <h2 className="text-base font-bold text-navy">Right now · Tactical</h2>
             <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${URGENCY_STYLE[groupUrgency.level]}`}>urgency: {groupUrgency.level}</span>
           </div>
+          <p className="mt-1 text-[11px]" data-testid="tactical-status">
+            <span className="font-semibold text-navy">Tactical:</span>{" "}
+            {tacticalState.status === "idle"
+              ? "waiting for a reason to decide"
+              : tacticalState.status === "running"
+                ? "deciding now (≤ 5 s budget)…"
+                : tacticalState.status === "muse"
+                  ? `Muse decision${tacticalState.decision ? ` ${tacticalState.decision}` : ""} in ${((tacticalState.ms ?? 0) / 1000).toFixed(1)} s`
+                  : tacticalState.status === "stale"
+                    ? `last result discarded as stale (${tacticalState.detail})`
+                    : tacticalState.status === "error"
+                      ? `error: ${tacticalState.detail}`
+                      : `deterministic ranking (${tacticalState.status}${tacticalState.detail ? `: ${tacticalState.detail.slice(0, 80)}` : ""}) in ${((tacticalState.ms ?? 0) / 1000).toFixed(1)} s`}
+          </p>
+          {tacticalState.headline && tacticalState.status === "muse" && <p className="mt-0.5 text-xs font-medium text-navy">“{tacticalState.headline}”</p>}
+          {plan && (
+            <div className="mt-2 flex flex-wrap gap-1" aria-label="Demo quick actions">
+              <button type="button" onClick={() => void quickSay("we're all getting really hungry now")} disabled={chatBusy} className="rounded-full border border-slate-300 px-2 py-0.5 text-[11px] hover:bg-slate-50 disabled:opacity-40">
+                😋 Hungry now
+              </button>
+              <button type="button" onClick={() => void quickSay("the kids really need a washroom asap")} disabled={chatBusy} className="rounded-full border border-slate-300 px-2 py-0.5 text-[11px] hover:bg-slate-50 disabled:opacity-40">
+                🚻 Urgent washroom
+              </button>
+              <button type="button" onClick={() => setWeatherOverride((w) => (w === "rain" ? "live" : "rain"))} className={`rounded-full border px-2 py-0.5 text-[11px] ${weatherOverride === "rain" ? "border-navy bg-navy text-white" : "border-slate-300 hover:bg-slate-50"}`}>
+                🌧 {weatherOverride === "rain" ? "Rain on" : "Make it rain"}
+              </button>
+              <button type="button" onClick={() => setSetupOpen(true)} className="rounded-full border border-slate-300 px-2 py-0.5 text-[11px] hover:bg-slate-50 lg:hidden">
+                📍 Change trip
+              </button>
+            </div>
+          )}
           <ul className="mt-1 space-y-0.5 text-xs text-slate-600">
             {(groupUrgency.reasons.length ? groupUrgency.reasons : ["no active need"]).map((r) => (
               <li key={r}>• {r}</li>
@@ -996,6 +1219,23 @@ export default function TripPlanner() {
           </div>
         </section>
 
+        {plan && plan.setup.dataMode !== "demo" && (
+          <StrategicPanel
+            state={strategic.state}
+            isCurrent={strategic.isCurrent}
+            leadKm={lead?.progressKm ?? 0}
+            placeName={(id) => knownPlaces.find((p) => p.id === id)?.name ?? null}
+            update={strategicUpdate}
+            onAskTactical={() => {
+              setStrategicUpdate(null);
+              memoryRef.current = { ...memoryRef.current, lastKey: null, lastCallElapsed: null };
+              setMemory(memoryRef.current);
+              void runRef.current("manual");
+            }}
+            onDismissUpdate={() => setStrategicUpdate(null)}
+          />
+        )}
+
         <section className="rounded-xl border border-slate-200 bg-white p-3">
           <h2 className="text-base font-bold text-navy">Talk to Uncongest</h2>
           <div className="mt-1 flex flex-wrap gap-1 text-xs">
@@ -1027,7 +1267,18 @@ export default function TripPlanner() {
           </div>
         </section>
 
-        <Inspector result={result} usage={usage} request={lastRequest} agent1={agent1} contextIncluded={agentContext?.includedBecause ?? []} prefetchTrace={prefetchTrace} />
+        <Inspector
+          perf={{
+            tactical: summarize(tacticalSamples, 5000),
+            strategic: summarize(strategicSamples, 30000),
+            staleTactical,
+            staleStrategic: strategic.state.staleRejected,
+            timings,
+            strategicStatus: strategic.state.status,
+            strategicTrace: strategic.state.meta?.toolTrace ?? [],
+            strategicMuse: strategic.state.meta?.muse
+          }}
+          result={result} usage={usage} request={lastRequest} agent1={agent1} contextIncluded={agentContext?.includedBecause ?? []} prefetchTrace={prefetchTrace} />
 
         <section className="rounded-xl border border-slate-200 bg-white p-3">
           <h2 className="text-sm font-bold text-navy">Trip log</h2>

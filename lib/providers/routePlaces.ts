@@ -21,11 +21,14 @@ export class RoutePlaceProvider implements PlaceProvider {
   private readonly sessionId?: string;
   private readonly tomtomVerifyTop: number;
   private readonly fetchImpl?: typeof fetch;
+  /** Fast path: only use cached tiles (no live Overpass, no TomTom fallback/verification). */
+  private readonly cacheOnly: boolean;
 
   constructor(
     private readonly route: RouteModel,
-    opts: { sessionId?: string; tomtomVerifyTop?: number; fetchImpl?: typeof fetch } = {}
+    opts: { sessionId?: string; tomtomVerifyTop?: number; fetchImpl?: typeof fetch; cacheOnly?: boolean } = {}
   ) {
+    this.cacheOnly = opts.cacheOnly === true;
     this.sessionId = opts.sessionId;
     this.tomtomVerifyTop = Math.max(0, opts.tomtomVerifyTop ?? 0);
     this.fetchImpl = opts.fetchImpl;
@@ -52,10 +55,15 @@ export class RoutePlaceProvider implements PlaceProvider {
     const broad = broadNeeds(opts.needs);
     const results = await mapLimit(tiles, 2, async (t) => {
       try {
-        const res = await discoverOsmPlaces(this.route, t, broad, { sessionId: this.sessionId, fetchImpl: this.fetchImpl });
+        const res = await discoverOsmPlaces(this.route, t, broad, { sessionId: this.sessionId, fetchImpl: this.fetchImpl, cacheOnly: this.cacheOnly });
         this.trace.push(`${label} tile km ${t.minKm.toFixed(0)}–${t.maxKm.toFixed(0)}: ${res.candidates.length} place(s), ${res.provenance}`);
         return res.candidates;
       } catch (err) {
+        if (this.cacheOnly) {
+          // a cache miss in the fast path is not an OSM failure → no TomTom fallback
+          this.trace.push(`${label} tile km ${t.minKm.toFixed(0)}–${t.maxKm.toFixed(0)}: not cached (skipped in fast path)`);
+          return [] as StopCandidate[];
+        }
         failedTiles++;
         this.trace.push(`${label} tile km ${t.minKm.toFixed(0)}–${t.maxKm.toFixed(0)}: OSM lookup failed — ${(err as Error).message}`);
         return [] as StopCandidate[];
@@ -63,7 +71,7 @@ export class RoutePlaceProvider implements PlaceProvider {
     });
     const wanted = opts.needs.length ? opts.needs : broad;
     let pool = results.flat();
-    if (tiles.length > 0 && failedTiles === tiles.length) {
+    if (!this.cacheOnly && tiles.length > 0 && failedTiles === tiles.length) {
       const tt = await searchAlongRouteTomTom(this.route, { minKm: opts.minKm, maxKm: opts.maxKm }, wanted, {
         sessionId: this.sessionId,
         fetchImpl: this.fetchImpl
@@ -86,7 +94,7 @@ export class RoutePlaceProvider implements PlaceProvider {
       .slice(0, MAX_PER_DECISION);
     if (candidates.length === 0) this.trace.push(`${label}: no real places found for [${wanted.join(", ")}] in this window`);
 
-    if (this.tomtomVerifyTop > 0 && candidates.length > 0) {
+    if (!this.cacheOnly && this.tomtomVerifyTop > 0 && candidates.length > 0) {
       const n = Math.min(this.tomtomVerifyTop, candidates.length);
       for (let i = 0; i < n; i++) {
         const c = candidates[i];

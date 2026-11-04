@@ -45,11 +45,15 @@ export interface WatchInput {
   /** Hard dietary rules and excluded region, so the watcher's timing matches Agent 2's checks. */
   requiredDiet?: Dietary[];
   avoidRegion?: string | null;
+  /** Early-trip quiet window (e.g. 30 min after leaving Home): routine reminders are held. */
+  departureQuiet?: { untilElapsed: number; reason: string };
   memory: WatchMemory;
 }
 
 export interface WatchDecision {
   shouldCall: boolean;
+  /** True when the call is allowed only because of the final-opportunity-before-gap exception. */
+  overrideInitialQuiet?: boolean;
   key: string;
   reasons: string[];
   /** First relevant opportunity that can still be taken with enough notice. */
@@ -110,10 +114,25 @@ export function watch(input: WatchInput): WatchDecision {
 
   const base = { key, nextOpportunity, gapAfterKm, missedRecommendation };
   const quiet = (why: string): WatchDecision => ({ ...base, shouldCall: false, reasons: [...reasons, why] });
-  const call = (why: string): WatchDecision => ({ ...base, shouldCall: true, reasons: [...reasons, why] });
+  const call = (why: string): WatchDecision => ({
+    ...base,
+    shouldCall: true,
+    overrideInitialQuiet: Boolean(input.departureQuiet && elapsedMinutes < input.departureQuiet.untilElapsed && urgency.reminderOnly),
+    reasons: [...reasons, why]
+  });
 
   if (input.confirmedStopPending) return quiet("stop confirmed; quiet until reached");
   if (urgency.level === "none") return quiet("no active need — stay quiet");
+  if (input.departureQuiet && elapsedMinutes < input.departureQuiet.untilElapsed) {
+    const explicit = !urgency.reminderOnly;
+    const window0 = input.advanceNoticeMinutes + APPROACH_WINDOW_MIN[urgency.level];
+    const finalBeforeGap =
+      nextOpportunity != null && gapAfterKm != null && gapAfterKm >= LIMITED_FACILITIES_GAP_KM && nextOpportunity.minutesAhead <= window0;
+    if (!explicit && urgency.level !== "high" && !finalBeforeGap) {
+      return quiet(`${input.departureQuiet.reason} — routine stops held until ${Math.round(input.departureQuiet.untilElapsed)} min (explicit/urgent requests still go through)`);
+    }
+    if (finalBeforeGap && !explicit) reasons.push(`last suitable stop before a ${Math.round(gapAfterKm!)} km gap — overriding the early-trip quiet window`);
+  }
   if (!missedRecommendation && key === memory.lastKey) return quiet("situation unchanged since last decision (deduplicated)");
 
   if (missedRecommendation) {
