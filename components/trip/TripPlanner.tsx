@@ -106,6 +106,9 @@ export default function TripPlanner() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const loadingRef = useRef(false);
+  const [heldForDecision, setHeldForDecision] = useState(false);
+  const playingRef = useRef(false);
+  const [usage, setUsage] = useState<NonNullable<EngineResult["usage"]>>([]);
   const [memory, setMemory] = useState<WatchMemory>(EMPTY_MEMORY);
   const memoryRef = useRef<WatchMemory>(EMPTY_MEMORY);
   const [watcherOn, setWatcherOn] = useState(true);
@@ -201,6 +204,7 @@ export default function TripPlanner() {
   const groupDiet = useMemo(() => [...new Set(Object.values(intents).flatMap((i) => i.dietary))].sort(), [intents]);
 
   // ---------------- playback ----------------
+  playingRef.current = playing;
   useEffect(() => {
     if (!playing) return;
     const id = setInterval(() => {
@@ -347,6 +351,7 @@ export default function TripPlanner() {
         return [...prev, ...found.filter((f) => !ids.has(f.id))].sort((a, b) => a.distanceAlongRouteKm - b.distanceAlongRouteKm);
       });
       setPrefetchTrace((t) => [...t, ...(data.trace ?? [])]);
+      if (data.usage?.length) setUsage(data.usage);
       pushLog("info", `Found ${found.length} real place(s) from OpenStreetMap${(data.trace ?? []).some((x: string) => x.includes("failed")) ? " (some lookups failed — see inspector)" : ""}.`);
     } catch (e) {
       pushLog("error", `Real-place discovery unavailable: ${(e as Error).message}. Agent 2 will retry selectively when needed.`);
@@ -483,6 +488,12 @@ export default function TripPlanner() {
       loadingRef.current = true;
       setLoading(true);
       setLastRequest(body);
+      // Simulated time holds while Uncongest decides, so a slow lookup never lets the car drive past the exit.
+      const wasPlaying = playingRef.current;
+      if (wasPlaying) {
+        setPlaying(false);
+        setHeldForDecision(true);
+      }
       if (key) {
         memoryRef.current = { ...memoryRef.current, lastKey: key, lastCallElapsed: elapsed };
         setMemory(memoryRef.current);
@@ -498,6 +509,7 @@ export default function TripPlanner() {
         const r = data as TripResult;
         setError(null);
         setResult(r);
+        if (r.usage?.length) setUsage(r.usage);
         if (r.recommendedStops?.length) {
           setKnownPlaces((prev) => {
             const ids = new Set(prev.map((p) => p.id));
@@ -519,6 +531,10 @@ export default function TripPlanner() {
       } finally {
         loadingRef.current = false;
         setLoading(false);
+        if (wasPlaying) {
+          setHeldForDecision(false);
+          setPlaying(true);
+        }
       }
     },
     [buildRequest, elapsed, pushLog]
@@ -713,7 +729,7 @@ export default function TripPlanner() {
     <div className="grid gap-3 p-3 lg:grid-cols-[320px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)_400px]">
       {/* LEFT — setup */}
       <aside className="min-w-0 lg:row-span-2 xl:row-span-1">
-        <div className="rounded-xl border border-slate-200 bg-white p-3">
+        <div className="rounded-xl border border-slate-200 bg-white p-3 lg:sticky lg:top-2 lg:max-h-[calc(100vh-1rem)] lg:overflow-y-auto">
           <button type="button" onClick={() => setSetupOpen((o) => !o)} className="flex w-full items-center justify-between text-left lg:hidden" aria-expanded={setupOpen}>
             <span className="text-base font-bold text-navy">Trip setup</span>
             <span className="text-xs text-slate-500">{setupOpen ? "hide" : "edit"}</span>
@@ -930,7 +946,11 @@ export default function TripPlanner() {
               {loading ? "Deciding…" : "Replan now"}
             </button>
           </div>
-          {loading && <p className="mt-1 text-xs text-slate-500">Agent 2 is checking real places at the exits ahead and the forecast at arrival…</p>}
+          {loading && (
+            <p className="mt-1 text-xs text-slate-500">
+              Agent 2 is checking real places at the exits ahead and the forecast at arrival…{heldForDecision ? " (simulated time paused meanwhile)" : ""}
+            </p>
+          )}
           {error && (
             <p className="mt-1 rounded bg-red-50 p-2 text-xs text-red-800" role="alert">
               Couldn’t get a decision — this is an error, not “no stop needed”. {error}
@@ -1007,7 +1027,7 @@ export default function TripPlanner() {
           </div>
         </section>
 
-        <Inspector result={result} request={lastRequest} agent1={agent1} contextIncluded={agentContext?.includedBecause ?? []} prefetchTrace={prefetchTrace} />
+        <Inspector result={result} usage={usage} request={lastRequest} agent1={agent1} contextIncluded={agentContext?.includedBecause ?? []} prefetchTrace={prefetchTrace} />
 
         <section className="rounded-xl border border-slate-200 bg-white p-3">
           <h2 className="text-sm font-bold text-navy">Trip log</h2>

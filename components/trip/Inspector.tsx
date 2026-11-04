@@ -15,19 +15,21 @@ export interface Agent1Trace {
 /** Agent 1 / Agent 2 inspector: real tool traces and API budget counters; raw JSON tucked away. */
 export default function Inspector({
   result,
+  usage: usageProp,
   request,
   agent1,
   contextIncluded,
   prefetchTrace
 }: {
   result: (EngineResult & { dataMode?: string }) | null;
+  usage?: NonNullable<EngineResult["usage"]>;
   request: unknown;
   agent1: Agent1Trace[];
   contextIncluded: string[];
   prefetchTrace: string[];
 }) {
   const [tab, setTab] = useState<"agent2" | "agent1" | "budget">("agent2");
-  const usage = result?.usage ?? [];
+  const usage = usageProp?.length ? usageProp : result?.usage ?? [];
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-3 text-xs" data-testid="inspector">
       <div className="flex gap-1" role="tablist">
@@ -65,8 +67,8 @@ export default function Inspector({
                     .filter((t) => t.tool !== "places.osm.detail")
                     .map((t, i) => (
                       <tr key={i} className="border-t border-slate-100 align-top">
-                        <td className="py-1 font-mono text-[10px] text-navy">{t.tool}</td>
-                        <td className="py-1">
+                        <td className="break-all py-1 pr-1 font-mono text-[10px] text-navy">{t.tool}</td>
+                        <td className="break-words py-1">
                           <span className="text-slate-500">{t.input}</span>
                           {t.input && " → "}
                           {t.output}

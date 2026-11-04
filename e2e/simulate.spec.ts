@@ -19,7 +19,7 @@ const log = (page: Page) => page.locator("aside").filter({ has: page.getByRole("
 
 test("real map renders the route, exits and a car that can be placed and dragged", async ({ page }) => {
   await open(page);
-  await expect(page.getByText(/real road geometry and real eastbound exits/)).toBeVisible();
+  await expect(page.getByText(/real road geometry and real exits/)).toBeVisible();
   const carA = page.locator('[title="Car A — drag to reposition"]');
   await expect(carA).toBeVisible();
 

@@ -130,8 +130,7 @@ export async function POST(req: Request) {
             `places.osm.${pass}`,
             `km ${w.minKm.toFixed(0)}–${w.maxKm.toFixed(0)} needs [${o.needs.join(", ") || "any"}]`,
             () => rp.getCandidates(pass, { ...o, ...w }),
-            (r) => `${r.length} real place(s)`,
-            "live"
+            (r) => `${r.length} real place(s) (live/cached per tile: see discovery detail)`
           );
           out.push(...found.filter((f) => !out.some((x) => x.id === f.id)));
         }

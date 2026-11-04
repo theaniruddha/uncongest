@@ -48,6 +48,27 @@ Regenerate the cached route/exit fixture with `node scripts/build-route-fixture.
 
 **Never commit API keys, credentials, precise live location traces, or real traveler identities.** Stop businesses are fictional; their *locations and exit numbers* are real.
 
+## Trip simulator (`/trip`) — configurable, real-data
+Pick an origin and destination (search, presets, or "Use current location"), depart-at or arrive-by, mood, meal preference, diets, kids, meal history, 1–3 cars — or describe the trip in plain English and review Agent 1's suggestions before applying. Then **Plan route & start simulation**:
+
+1. `/api/route` resolves a **real route** (OSRM) with **real exits** (OSM `motorway_junction`, or OSRM ramp steps when Overpass is down — labelled). Unresolvable trips show a clear error and suggest the 401 demo; geometry is never invented.
+2. Deterministic **opportunity windows** (meal times, rest breaks, coffee) pick a few road segments; `/api/places/prefetch` discovers **real places from OpenStreetMap** only there (30 km tiles, cached in memory + disk + committed recordings). More is fetched lazily only when a need is active and nothing is known ahead.
+3. The car moves along the real geometry in simulated time. The **ambient watcher** calls **Agent 2** only when a decision is useful; simulated time pauses while it decides.
+4. Agent 2 runs the deterministic checks, the urgency-bounded horizon, **Open-Meteo forecasts at each stop's arrival time and at the destination** (real forecast date shown), and one LLM call. Results show detour, editable stop length, **destination-ETA impact** and arrival daylight.
+5. **Stop lifecycle**: Select → drive there / skip ahead → ARRIVED (paused) → spend N min → confirm what actually happened (nothing is assumed) → COMPLETED → Resume. ETA, last stop, driving-since-rest (reset after ≥ 60 min) and meal history update; each car's participation is independent.
+
+**Data labels**: "REAL · OSM" places vs "FICTIONAL DEMO" fixtures (401 demo preset only); routes show `osrm` / `cache` / `fixture`; weather shows Open-Meteo vs simulated/unavailable; recorded data shows its date.
+
+**API budgets** (server-side, per process, shown in the inspector): TomTom is **off** unless `TOMTOM_LIVE=1` (+ `TOMTOM_API_KEY`), then capped per hour and per session and used only for along-route fallback/verification. Overpass, OSRM, Nominatim (1 req/s) and Open-Meteo are budgeted and cached. Override with `<PROVIDER>_WINDOW_LIMIT`, `<PROVIDER>_SESSION_LIMIT`, `<PROVIDER>_WINDOW_MS`.
+
+**Recordings**: `npx vitest run --config vitest.record.config.ts` records preset routes + their OSM tiles to `data/recorded/` (committed; served as cached data with its date).
+
+### Hosting for friends
+- Keep secrets server-side (`MODEL_API_KEY`/`MUSE_API_KEY`, `TOMTOM_API_KEY`); leave `TOMTOM_LIVE` unset unless you want live TomTom.
+- Set `LLM_MAX_CALLS_PER_10_MIN` (default 30) and conservative Overpass/OSRM/Nominatim limits; budgets are in-memory per server instance.
+- Public OSRM / Overpass / Nominatim demo servers have usage policies and no SLA — for real traffic, point `OVERPASS_URL` at your own instance and use a hosted router.
+- Runtime caches go to `UNCONGEST_CACHE_DIR` (default `.cache`, `/tmp/uncongest-cache` on Vercel).
+
 ## Current status
 **Architecture: two bounded agents + deterministic context layer + deterministic watcher.**
 
@@ -60,6 +81,9 @@ Regenerate the cached route/exit fixture with `node scripts/build-route-fixture.
 - `/simulate` controls: departure time, honest playback rates (1× = real time … 300×), scrub, per-car speed / kids / frozen GPS, add/remove cars, live vs simulated weather, meal history (unknown by default), skip (excludes + re-plans) / approve / per-stop per-car votes, request/response inspector for both agents, event log. `/simulate?demo=1` auto-runs the one-car lunch scenario.
 
 ### Known limitations
+- `/trip`: public Overpass servers were overloaded during development (20–70 s per query, frequent timeouts); discovery then degrades to fewer/no real places, clearly traced. Recordings cover the presets.
+- `/trip`: OSM rarely has opening hours, menus or restroom access — shown as unverified, never invented. TomTom category ids for along-route search are unverified until TomTom is enabled.
+- Sunset/daylight uses the NOAA solar algorithm at the destination; time zone is the origin's (via Open-Meteo), so cross-time-zone trips show times in the origin zone.
 - Stop businesses, ratings and hours are fictional fixtures (anchored to real exits); no live Places provider yet.
 - In-memory demo state (no Supabase sync); the watcher stops when the tab is suspended.
 - Simulated cars use constant cruise speed; no live traffic. OSM tiles need network (route/exits still draw offline).

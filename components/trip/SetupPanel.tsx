@@ -346,7 +346,7 @@ export default function SetupPanel({
         )}
       </div>
 
-      <div className="sticky bottom-0 -mx-3 mt-3 border-t border-slate-200 bg-white px-3 py-2">
+      <div className="-mx-3 mt-3 border-t border-slate-200 bg-white px-3 py-2 lg:sticky lg:-bottom-3 lg:pb-3">
         <button type="button" onClick={onPlan} disabled={planning || !canStart} className="focus-ring w-full rounded-md bg-navy px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">
           {planning ? "Calculating real route…" : "Plan route & start simulation"}
         </button>
